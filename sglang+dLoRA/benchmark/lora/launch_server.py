@@ -3,13 +3,16 @@ import os
 
 import subprocess
 
-NUM_LORAS = 2 # 定义Lora模型数量
+NUM_LORAS = 4 # 定义Lora模型数量
 LORA_PATH = { # 定义模型路径字典
     "base": "/workspace/models/Llama-2-7b-hf",
     # "lora": "winddude/wizardLM-LlaMA-LoRA-7B",
     # "lora": "/workspace/models/fingpt-mt_llama2-7b_lora",
     "lora": "/workspace/models/llama-2-7b-chat-lora-adaptor",
     "lora": "/workspace/models/llama-2-7b-LORA-data-analyst",
+    "lora": "/workspace/models/llama2-stable-7b-lora",
+    "lora": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
+    "lora": "/workspace/models/MUFFIN-Llama2-lora-7B",
 }
 
 
