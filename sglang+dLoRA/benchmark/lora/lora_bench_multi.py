@@ -47,7 +47,12 @@ from sglang.bench_serving import ( # 导入sglang.bench_serving中的工具函�
 from workload_generator.trace import Trace
 from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
 
-from sglang.srt.managers.instance_manager import InstanceManager, InferenceArchitecture
+from sglang.srt.instances.engine_manager import (
+    EngineManager,
+    ExecType,
+    MigrationType,
+    create_engine_manager,
+)
 
 """
 1. sample_random_requests：负责“生成请求样本”。输出是一个 List[DatasetRow]（每个 DatasetRow 包含 prompt、prompt_len、output_len、可选 timestamp 等）。不负责什么时候发送，只负责构建请求内容和长度分布。
@@ -203,66 +208,110 @@ async def benchmark(
     disable_tqdm: bool,
     extra_request_body: Dict[str, Any],
 ):
-    if backend in ASYNC_REQUEST_FUNCS: # 检查后端是否支持
-        request_func = ASYNC_REQUEST_FUNCS[backend] # 获取对应请求函数
+    if backend in ASYNC_REQUEST_FUNCS:
+        request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
-        raise ValueError(f"Unknown backend: {backend}") # 不支持则报错
-    
-    # 使用 --worker-urls 做实例列表；没有则回退到 api_url（单实例）
-    worker_urls = [_normalize_endpoint(u) for u in (args.worker_urls or [])]
-    if not worker_urls:
-        worker_urls = [_normalize_endpoint(api_url)]
+        raise ValueError(f"Unknown backend: {backend}")
 
-    inferencearchitecture = InferenceArchitecture.DLORA if args.inference_architecture == "dlora" else InferenceArchitecture.SGLANG
-    instance_manager = InstanceManager(
-        worker_urls=worker_urls,
-        num_loras=NUM_LORAS,
-        inference_architecture=inferencearchitecture,
-    )
+    # 规范化实例 URL（保持不带 /generate 的基地址，再发送时拼接）
+    raw_worker_urls = args.worker_urls or []
+    worker_base_urls: List[str] = []
+    for u in raw_worker_urls:
+        u = u.rstrip("/")
+        if u.endswith("/generate"):
+            u = u[: -len("/generate")]
+        worker_base_urls.append(u)
+    if not worker_base_urls:
+        base_api = api_url.rstrip("/")
+        if base_api.endswith("/generate"):
+            base_api = base_api[: -len("/generate")]
+        worker_base_urls = [base_api]
 
-    print(f"\n[Benchmark] Instance Manager Stats:")
-    print(instance_manager.get_stats())
+    num_instances = len(worker_base_urls)
 
-    # ... 后续代码中，使用 instance_manager.select_worker(lora_path) 替代原来的轮询逻辑 ...
+    # 根据推理架构分支
+    engine_manager = None
+    static_lora_routing: Dict[str, str] = {}
 
-    print("Starting initial single prompt test run...") # 打印测试信息
-    test_request = input_requests[0] # 取第一个请求做测试
-    test_lora_name = "dummy"
-    if not args.base_only:
-        test_lora_name = "lora0"
+    if args.inference_architecture == "dlora":
+        # 迁移类型映射
+        mig_map = {
+            "dispatch_only": MigrationType.DISPATCH_ONLY,
+            "dispatch_mig": MigrationType.DISPATCH_MIG,
+            "period_mig": MigrationType.PERIOD_MIG,
+            "1": MigrationType.DISPATCH_ONLY,
+            "2": MigrationType.DISPATCH_MIG,
+            "3": MigrationType.PERIOD_MIG,
+        }
+        mig_type = mig_map.get(str(args.migration_type), MigrationType.PERIOD_MIG)
+
+        # 使用 create_engine_manager 创建（按照端口自增或直接使用列表时需重建）
+        # 这里直接用显式列表替换 create_engine_manager 内部的端口生成逻辑
+        engine_manager = create_engine_manager(
+            backend="sglang",
+            num_instances=num_instances,
+            num_loras=NUM_LORAS,
+            base_url="__unused__",   # 占位，不用
+            base_port=0,             # 占位，不用
+            exec_type=ExecType.LORA,
+            migration_type=mig_type,
+            max_loras_per_batch=args.max_loras_per_batch,
+            max_running_requests=args.max_running_requests,
+            migration_interval=args.migration_interval,
+            migration_req_threshold=args.migration_req_threshold,
+        )
+        # 覆盖为实际的实例 URL 列表
+        engine_manager.instance_urls = worker_base_urls
+
+        if mig_type == MigrationType.PERIOD_MIG:
+            engine_manager.start_background_loop()
+        print(f"\n[Benchmark] EngineManager Stats: {engine_manager.get_stats()}")
+    else:
+        # sglang: 静态均分 LoRA -> 实例
+        for lora_idx in range(NUM_LORAS):
+            inst_id = lora_idx % num_instances
+            static_lora_routing[f"lora{lora_idx}"] = f"{worker_base_urls[inst_id]}/generate"
+        static_lora_routing["dummy"] = f"{worker_base_urls[0]}/generate"
+        print("\n[Benchmark] 静态 LoRA 路由 (sglang):")
+        for k, v in static_lora_routing.items():
+            if k.startswith("lora"):
+                print(f"  {k} -> {v}")
+
+    print("Starting initial single prompt test run...")
+    test_request = input_requests[0]
+    test_lora_name = "dummy" if args.base_only else "lora0"
+
+    if engine_manager:
+        _, inst_url = await engine_manager.select_instance("test_req_0", 0)
+        test_api_url = f"{inst_url}/generate"
+    else:
+        test_api_url = static_lora_routing[test_lora_name]
+
     test_input = RequestFuncInput(
         model=base_model_id,
         prompt=test_request.prompt,
-        api_url=worker_urls[0],  # 用第一个实例做连通性测试
+        api_url=test_api_url,
         prompt_len=test_request.prompt_len,
         output_len=test_request.output_len,
-        lora_name=test_lora_name,  # the lora_name argument is dummy if base_only is True, since no lora model is used
+        lora_name=test_lora_name,
         image_data=None,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input) # 执行测试请求
-    if not test_output.success: # 如果测试失败
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
-        )
-    else: # 测试通过
+    test_pbar = tqdm(total=1, desc="Test request")
+    test_output = await request_func(request_func_input=test_input, pbar=test_pbar)
+    test_pbar.close()
+    # test_output = await request_func(request_func_input=test_input)
+    if not test_output.success:
+        raise ValueError(f"Initial test run failed: {test_output.error}")
+    else:
         print("Initial test run completed. Starting main benchmark run...")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests)) # 创建进度条
-
-    benchmark_start_time = time.perf_counter() # 记录基准测试开始时间
-    '''
-    创建一个空列表，用来存放所有异步任务（每个任务代表一次请求）。
-    '''
-    tasks: List[asyncio.Task] = [] # 初始化异步任务列表
-    '''
-    异步循环，从 get_request 这个生成器里按设定速率依次获取请求数据（request）。
-    '''
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    benchmark_start_time = time.perf_counter()
+    tasks: List[asyncio.Task] = []
     request_idx = 0
-    # 新增：根据 --use-trace 决定调度来源
+
     if args.use_trace:
-        # 生成 trace workload（num_models 视为 LoRA 数量）
         workload = Trace(
             trace_name=args.trace_name,
             trace_dir=args.trace_path,
@@ -280,11 +329,13 @@ async def benchmark(
         )
         request_generator = get_trace_requests(input_requests, workload)
         async for model_id, request in request_generator:
-            # 按 trace 模型 id 映射到 lora 名称
             lora_path = "dummy" if args.base_only else f"lora{model_id}"
-            # 使用 Instance Manager 选择 worker
-            target_api_url = instance_manager.select_worker(lora_path)
-            request_func_input = RequestFuncInput(
+            if engine_manager:
+                _, inst_url = await engine_manager.select_instance(f"req_{request_idx}", model_id)
+                target_api_url = f"{inst_url}/generate"
+            else:
+                target_api_url = static_lora_routing[lora_path]
+            req_input = RequestFuncInput(
                 model=base_model_id,
                 prompt=request.prompt,
                 api_url=target_api_url,
@@ -294,28 +345,30 @@ async def benchmark(
                 image_data=None,
                 extra_request_body=extra_request_body,
             )
-            tasks.append(
-                asyncio.create_task(
-                    request_func(request_func_input=request_func_input, pbar=pbar)
-                )
-            )
+            tasks.append(asyncio.create_task(request_func(request_func_input=req_input, pbar=pbar)))
             request_idx += 1
     else:
-        # 原来的速率调度逻辑
-        prompts_per_lora = len(input_requests) // NUM_LORAS
+        prompts_per_lora = max(1, len(input_requests) // NUM_LORAS)
         async for request in get_request(input_requests, request_rate):
             if args.base_only:
                 lora_path = "dummy"
+                lora_id = 0
             else:
                 if args.lora_assignment_strategy == "random":
-                    lora_path = f"lora{random.randint(0, NUM_LORAS - 1)}"
+                    lora_id = random.randint(0, NUM_LORAS - 1)
                 elif args.lora_assignment_strategy == "sequential":
-                    lora_index = min(request_idx // prompts_per_lora, NUM_LORAS - 1)
-                    lora_path = f"lora{lora_index}"
+                    lora_id = min(request_idx // prompts_per_lora, NUM_LORAS - 1)
                 else:
-                    lora_path = "lora0"
-            target_api_url = worker_urls[request_idx % len(worker_urls)]
-            request_func_input = RequestFuncInput(
+                    lora_id = 0
+                lora_path = f"lora{lora_id}"
+
+            if engine_manager:
+                _, inst_url = await engine_manager.select_instance(f"req_{request_idx}", lora_id)
+                target_api_url = f"{inst_url}/generate"
+            else:
+                target_api_url = static_lora_routing[lora_path]
+
+            req_input = RequestFuncInput(
                 model=base_model_id,
                 prompt=request.prompt,
                 api_url=target_api_url,
@@ -325,29 +378,25 @@ async def benchmark(
                 image_data=None,
                 extra_request_body=extra_request_body,
             )
-            tasks.append(
-                asyncio.create_task(
-                    request_func(request_func_input=request_func_input, pbar=pbar)
-                )
-            )
+            tasks.append(asyncio.create_task(request_func(request_func_input=req_input, pbar=pbar)))
             request_idx += 1
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks) # 并发执行所有请求
-    """
-    请求是随时并发发送的，收集结果是一次性完成的。
-    """
 
-    if pbar is not None:
-        pbar.close() # 关闭进度条
+    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    benchmark_duration = time.perf_counter() - benchmark_start_time # 计算测试总时长
+    if pbar:
+        pbar.close()
 
+    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
-    ) # 计算各项评测指标
+    )
+
+    if engine_manager:
+        engine_manager.stop_background_loop()
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -644,9 +693,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--inference-architecture",
         type=str,
-        default="sglang",
+        default="dlora",
         choices=["sglang", "dlora"],
         help="LoRA serving architecture: 'sglang' for static assignment, 'dlora' for dynamic scheduling",
     )
+    # 新增 dLoRA 迁移参数
+    parser.add_argument("--migration-type", type=str, default="period_mig",
+                        choices=["dispatch_only", "dispatch_mig", "period_mig", "1", "2", "3"],
+                        help="迁移策略")
+    parser.add_argument("--migration-interval", type=int, default=10, help="周期迁移间隔秒")
+    parser.add_argument("--migration-req-threshold", type=int, default=16, help="负载迁移请求阈值")
+    parser.add_argument("--max-loras-per-batch", type=int, default=8, help="批次可合并的最大LoRA数量")
+    parser.add_argument("--max-running-requests", type=int, default=16, help="实例最大并发请求数")
     args = parser.parse_args()
     run_benchmark(args)
