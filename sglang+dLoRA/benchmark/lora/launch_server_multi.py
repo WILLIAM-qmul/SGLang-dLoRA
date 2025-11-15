@@ -10,11 +10,11 @@ LORA_PATH = { # 定义模型路径字典
     "base": "/workspace/models/Llama-2-7b-hf",
     # "lora": "winddude/wizardLM-LlaMA-LoRA-7B",
     # "lora": "/workspace/models/fingpt-mt_llama2-7b_lora",
-    "lora": "/workspace/models/llama-2-7b-chat-lora-adaptor",
-    "lora": "/workspace/models/llama-2-7b-LORA-data-analyst",
-    "lora": "/workspace/models/llama2-stable-7b-lora",
-    "lora": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
-    "lora": "/workspace/models/MUFFIN-Llama2-lora-7B",
+    "lora0": "/workspace/models/llama-2-7b-chat-lora-adaptor",
+    "lora1": "/workspace/models/llama-2-7b-LORA-data-analyst",
+    "lora2": "/workspace/models/llama2-stable-7b-lora",
+    "lora3": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
+    "lora4": "/workspace/models/MUFFIN-Llama2-lora-7B",
 }
 
 
@@ -22,7 +22,7 @@ LORA_PATH = { # 定义模型路径字典
 def build_cmd(args, port: int) -> str:
     """Build server launch command."""
     base_path = LORA_PATH["base"]
-    lora_path = LORA_PATH["lora"]
+    # lora_path = LORA_PATH["lora"]
 
     if args.base_only:
         cmd = f"python3 -m sglang.launch_server --model-path {base_path} "
@@ -30,6 +30,7 @@ def build_cmd(args, port: int) -> str:
         cmd = f"python3 -m sglang.launch_server --model-path {base_path} --lora-paths "
         for i in range(NUM_LORAS):
             lora_name = f"lora{i}"
+            lora_path = LORA_PATH[lora_name] 
             cmd += f"{lora_name}={lora_path} "
 
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
@@ -106,7 +107,7 @@ if __name__ == "__main__":
     )
     
     # Server configuration
-    parser.add_argument("--backend", type=str, default="dlora", 
+    parser.add_argument("--backend", type=str, default="sglang", 
                        choices=["sglang", "dlora"])
     parser.add_argument("--base-only", action="store_true",
                        help="Launch base model only without LoRA")
