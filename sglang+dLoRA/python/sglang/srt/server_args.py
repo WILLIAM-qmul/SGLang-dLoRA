@@ -907,8 +907,7 @@ class ServerArgs:
                     logger.info(
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if not self.enable_dp_attention:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
@@ -965,8 +964,7 @@ class ServerArgs:
             )
 
             if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if not self.enable_dp_attention:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -1004,8 +1002,7 @@ class ServerArgs:
                 "aiter",
                 "triton",
                 "trtllm_mha",
-                "intel_xpu",
-            }, "fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model"
+            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(

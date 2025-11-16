@@ -532,7 +532,6 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
-
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(

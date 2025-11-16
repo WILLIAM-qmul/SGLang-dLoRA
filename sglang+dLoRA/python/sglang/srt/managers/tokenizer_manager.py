@@ -996,11 +996,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        if not obj.stream:
-                            raise ValueError(finish_reason["message"])
-                        else:
-                            yield out
-                            break
+                        raise ValueError(finish_reason["message"])
 
                     if finish_reason.get("type") == "abort" and finish_reason.get(
                         "status_code"
@@ -1017,14 +1013,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-                        if not obj.stream:
-                            raise fastapi.HTTPException(
-                                status_code=finish_reason["status_code"],
-                                detail=finish_reason["message"],
-                            )
-                        else:
-                            yield out
-                            break
+
+                        raise fastapi.HTTPException(
+                            status_code=finish_reason["status_code"],
+                            detail=finish_reason["message"],
+                        )
                 yield out
                 break
 

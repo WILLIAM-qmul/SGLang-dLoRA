@@ -185,6 +185,8 @@ class GenerateReqInput(BaseReq):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The num of the LoRA adaptors
+    lora_num: Optional[Union[List[Optional[int]], Optional[int]]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
