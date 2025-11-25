@@ -80,7 +80,6 @@ class RequestFuncInput:
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
-    lora_num: Optional[int] = None  # 新增字段，用于标识LoRA适配器ID
 
 
 @dataclass
