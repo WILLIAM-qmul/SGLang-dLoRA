@@ -113,28 +113,39 @@ class LoRARegistry:
         Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters
         by incrementing its counter.
         """
+        """
+        根据 LoRA 名称查询注册表，获取对应的 LoRA ID，并开始追踪该 LoRA 适配器的使用（通过计数器自增）。
+        """
 
         def _lookup(name: str) -> str:
+            # 如果名称为 None，则直接返回 None
             if name is None:
                 return None
 
+            # 从注册表中查找 LoRARef 对象
             lora_ref = self._registry.get(name, None)
+            # 如果没有找到，抛出异常并提示已加载的适配器
             if lora_ref is None:
                 raise ValueError(
                     f"The following requested LoRA adapters are not loaded: {name}\n"
                     f"Loaded adapters: {self._registry.keys()}."
                 )
+            # 返回 LoRA 的唯一 ID
             return lora_ref.lora_id
 
+        # 读锁保护，允许并发查询（不阻塞其他读操作）
         async with self._registry_lock.reader_lock:
+            # 如果传入的是字符串（单个 LoRA 名称）
             if isinstance(lora_name, str):
-                lora_id = _lookup(lora_name)
+                lora_id = _lookup(lora_name)  # 查找 LoRA ID
+                # 对应计数器自增，表示有新请求正在使用该 LoRA
                 await self._counters[lora_id].increment(notify_all=False)
                 return lora_id
+            # 如果传入的是列表（多个 LoRA 名称）
             elif isinstance(lora_name, list):
-                lora_ids = [_lookup(name) for name in lora_name]
+                lora_ids = [_lookup(name) for name in lora_name]  # 查找所有 LoRA ID
 
-                # Increment the counters only after all IDs are looked up.
+                # 所有 ID 查找完后，再批量自增计数器（并发执行）
                 await asyncio.gather(
                     *[
                         self._counters[id].increment(notify_all=False)
@@ -144,6 +155,7 @@ class LoRARegistry:
                 )
                 return lora_ids
             else:
+                # 类型错误，必须是字符串或字符串列表
                 raise TypeError(
                     "lora_name must be either a string or a list of strings."
                 )

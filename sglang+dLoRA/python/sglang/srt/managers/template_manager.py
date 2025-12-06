@@ -17,6 +17,11 @@ Centralized template management for chat templates and completion templates.
 This module provides a unified interface for managing both chat conversation templates
 and code completion templates, eliminating global state and improving modularity.
 """
+"""
+集中式管理聊天模板和补全模板。
+
+本模块为聊天对话模板和代码补全模板提供了统一的管理接口，消除了全局状态，提高了模块化程度。
+"""
 
 import json
 import logging

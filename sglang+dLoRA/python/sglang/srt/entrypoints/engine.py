@@ -750,18 +750,20 @@ def _set_envs_and_config(server_args: ServerArgs):
 def _init_tokenizer_manager(
     server_args: ServerArgs, port_args: PortArgs
 ) -> TokenizerManager:
-    # Launch tokenizer process
+    # 启动分词管理器（TokenizerManager），负责文本分词、请求调度等核心功能
     tokenizer_manager = TokenizerManager(server_args, port_args)
 
-    # Initialize templates
+    # 创建模板管理器（TemplateManager），用于初始化和管理 prompt 模板
     template_manager = TemplateManager()
+    # 初始化模板，加载 chat/completion 等 prompt 模板到 template_manager
     template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
+        tokenizer_manager=tokenizer_manager,           # 传入分词管理器实例
+        model_path=server_args.model_path,             # 当前模型路径
+        chat_template=server_args.chat_template,       # 聊天模板（可选）
+        completion_template=server_args.completion_template, # 补全模板（可选）
     )
 
+    # 返回分词管理器和模板管理器实例
     return tokenizer_manager, template_manager
 
 
@@ -770,6 +772,9 @@ def _launch_subprocesses(
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+    """
+        在主进程中启动 TokenizerManager，在一个子进程中启动 Scheduler，在另一个子进程中启动 DetokenizerManager。
     """
     # Configure global environment
     configure_logger(server_args)

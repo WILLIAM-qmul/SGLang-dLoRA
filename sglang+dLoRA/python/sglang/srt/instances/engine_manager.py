@@ -1,569 +1,565 @@
+# File: sglang+dLoRA/python/sglang/srt/managers/engine_manager.py
 """
-Engine Manager for dLoRA-style multi-instance LoRA serving.
-Adapted from: https://github.com/LLMServe/dLoRA-artifact (vllm/engine/engine_manager.py)
+Engine Manager for managing multiple SGLang instances with dynamic load balancing. 
+Adapted from dLoRA-artifact's EngineManager to SGLang architecture.
 """
 
 import asyncio
-import math
-import random
-from dataclasses import dataclass
+import time
+import aiohttp
+import json
+import multiprocessing
+from typing import Dict, List, Tuple, Optional, Set
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import logging
 
-from sglang.srt.instances.migration_ilp import MigrationILP
+from sglang.srt. instances.migration_ilp import MigrationILP
 
-# Constants (same as dLoRA)
+logger = logging.getLogger(__name__)
+
 _GB = 1 << 30
-PCIE_BANDWIDTH = 32 * _GB
+PCIE_BANDWIDTH = 32 * _GB  # 32 GB/s
 
 
 class MigrationType(Enum):
-    """Migration strategies for LoRA adapters."""
+    """Migration strategy types"""
     DISPATCH_ONLY = 1      # Only dispatch, no migration
-    DISPATCH_MIG = 2       # Dispatch + on-demand migration
-    PERIOD_MIG = 3         # Periodic ILP-based migration
-
-
-class ExecType(Enum):
-    """Execution types for LoRA serving (kept for compatibility with dLoRA)."""
-    LORA = 1               # LoRA-based execution
-    REPLICATED = 2         # Replicated models across instances
-    MERGED = 3             # Merged LoRA execution
+    DISPATCH_MIG = 2       # Dispatch with migration
+    PERIOD_MIG = 3         # Periodic migration
 
 
 @dataclass
 class RequestMetadata:
-    """Metadata for a request in the system (for ILP)."""
+    """Metadata for a single request in the system"""
     request_id: str
     model_id: int
     engine_id: int
     num_blocks: int
-    prompt_len: int
-    output_len: int
-    arrival_time: float
-    exec_time: float = 0.0
+    in_gpu: bool
+    prompt_length: int = 0
+    output_length: int = 0
+    
+    def __repr__(self) -> str:
+        return (f"ReqMetadata(request_id={self.request_id}, "
+                f"model_id={self.model_id}, "
+                f"engine_id={self. engine_id}, "
+                f"num_blocks={self.num_blocks})")
+
+
+@dataclass
+class EngineStats:
+    """Statistics for a single engine instance"""
+    engine_id: int
+    num_requests: int
+    req_model_cnt: Dict[int, int]
+    num_free_gpu_blocks: int
+    num_free_cpu_blocks: int
+    lora_capacity: int
+    active_models: List[int]
+    req_metadata: List[RequestMetadata]
+    model_exec_time: Dict[int, Tuple[int, float]]
 
 
 class EngineManager:
     """
-    Multi-instance Engine Manager for dLoRA-style architecture on SGLang.
-
-    NOTE: 与 vLLM 版本不同，这里不直接管理 AsyncLLMEngine / KV Cache，
-    而是管理一组 HTTP SGLang 实例的 URL，并在调度时返回应该访问哪个实例。
+    Manages multiple SGLang engine instances with dynamic load balancing. 
+    
+    This manager handles:
+    - Request routing to engines
+    - Dynamic load balancing
+    - Request migration between engines
+    - LoRA adapter management across engines
     """
 
     def __init__(
         self,
-        exec_type: ExecType,
-        migration_type: MigrationType,
         num_instances: int,
-        num_loras: int,
+        num_models: int,
         instance_urls: List[str],
-        max_loras_per_batch: int = 8,
+        migration_type: MigrationType = MigrationType.PERIOD_MIG,
+        migration_interval: float = 5.0,
+        lora_capacity_per_engine: int = 8,
         max_running_requests: int = 16,
-        migration_interval: int = 10,
-        migration_req_threshold: int = 16,
-        cpu_swap_space_gb: int = 4,
     ):
         """
-        Initialize the EngineManager.
-
+        Initialize the Engine Manager.
+        
         Args:
-            exec_type: Execution type (LORA, REPLICATED, MERGED)
+            num_instances: Number of SGLang instances to manage
+            num_models: Total number of LoRA models
+            instance_urls: List of instance URLs (e.g., ["http://127.0.0.1:30001", ... ])
             migration_type: Migration strategy
-            num_instances: Number of SGLang instances
-            num_loras: Total number of LoRA adapters
-            instance_urls: HTTP base URLs of instances, e.g. ["http://127.0.0.1:30001", ...]
-            max_loras_per_batch: Max LoRA adapters per batch (similar to bs in dLoRA)
-            max_running_requests: Approximate capacity per instance (not strictly enforced here)
-            migration_interval: Time between migration checks (seconds)
-            migration_req_threshold: Request count threshold that triggers migration
-            cpu_swap_space_gb: For compatibility with dLoRA (unused in SGLang HTTP version)
+            migration_interval: Interval for periodic migration (seconds)
+            lora_capacity_per_engine: Max LoRA adapters per engine
+            max_running_requests: Max concurrent requests per engine
         """
-        self.exec_type = exec_type
-        self.migration_type = migration_type
         self.num_instances = num_instances
-        self.num_loras = num_loras
+        self.num_models = num_models
         self.instance_urls = instance_urls
-        self.max_loras_per_batch = max_loras_per_batch
-        self.max_running_requests = max_running_requests
+        self. migration_type = migration_type
         self.migration_interval = migration_interval
-        self.migration_req_threshold = migration_req_threshold
-        self.cpu_swap_space = cpu_swap_space_gb * _GB
-
-        # LoRA placement mappings (model_id <-> engine_id)
-        # lora_to_instances[lora_id] = [instance_id...]
-        # instance_to_loras[instance_id] = [lora_id...]
-        self.lora_to_instances: Dict[int, List[int]] = {i: [] for i in range(num_loras)}
-        self.instance_to_loras: Dict[int, List[int]] = {i: [] for i in range(num_instances)}
-
-        # Instance metrics
-        self.instance_num_requests: List[int] = [0] * num_instances
-        self.instance_num_free_blocks: List[int] = [0] * num_instances
-        # instance_req_lora_cnt[instance_id][lora_id] = num_requests
-        self.instance_req_lora_cnt: Dict[int, Dict[int, int]] = {}
-        # Approximated execution cost per instance
-        self.instance_exec_cost: Dict[int, float] = {}
-
-        # Request metadata tracking (for ILP)
-        self.reqs_metadata: Dict[int, List[RequestMetadata]] = {}
-
-        # LoRA execution statistics
-        # lora_exec_info[lora_id] = (count, total_exec_time)
-        self.lora_exec_info: Dict[int, Tuple[int, float]] = {
-            i: (0, 0.0) for i in range(num_loras)
-        }
-        self.lora_avg_exec_time: List[float] = [5.0] * num_loras
-
-        # Migration parameters (same semantics as dLoRA)
-        self.default_exec_time = 5.0
-        self.lora_load_cost = 0.1  # Estimated LoRA loading time
-        self.merge_speed_ratio = 0.6
-
-        # Expected LoRA distribution (maintained by commander)
-        self.expected_lora_distribution = [
-            (1.0 + 1e-7) / num_loras for _ in range(num_loras)
-        ]
-
-        # Capacity tracking (for ILP)
-        self.engine_lora_capacity: List[int] = [0] * num_instances
-        self.num_gpu_blocks: List[int] = [0] * num_instances
-        self.num_cpu_blocks: List[int] = [0] * num_instances
-
-        # Synchronization
+        self.lora_capacity_per_engine = lora_capacity_per_engine
+        self.max_running_requests = max_running_requests
+        
+        # Request tracking
+        self.request_to_engine: Dict[str, int] = {}  # request_id -> engine_id
+        self.engine_request_count: Dict[int, int] = {i: 0 for i in range(num_instances)}
+        
+        # Model distribution tracking
+        self.engine_active_models: Dict[int, Set[int]] = {i: set() for i in range(num_instances)}
+        
+        # Statistics
+        self.engine_stats: Dict[int, EngineStats] = {}
+        self.global_model_request_count: Dict[int, int] = {i: 0 for i in range(num_models)}
+        
+        # Async locks
         self.select_lock = asyncio.Lock()
-
-        # Background migration loop
+        self.migration_lock = asyncio.Lock()
+        
+        # Background tasks
         self.background_loop = None
-        self.is_running_flag = False
+        self._running = False
+        
+        # Aiohttp session for API calls
+        self._session: Optional[aiohttp.ClientSession] = None
+        
+        logger.info(f"EngineManager initialized with {num_instances} instances, "
+                   f"{num_models} models, migration_type={migration_type. name}")
 
-        # Initialize LoRA placement like dLoRA (分布式权重放置)
-        if exec_type != ExecType.REPLICATED:
-            self._initialize_lora_placement()
+    async def _get_session(self) -> aiohttp. ClientSession:
+        """Get or create aiohttp session"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=300)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
 
-        print(f"[EngineManager] Initialized:")
-        print(f"  - Instances: {num_instances}")
-        print(f"  - LoRAs: {num_loras}")
-        print(f"  - Exec Type: {exec_type.name}")
-        print(f"  - Migration Type: {migration_type.name}")
-        print(f"  - Initial LoRA Placement: {self.instance_to_loras}")
+    async def close(self):
+        """Close the manager and cleanup resources"""
+        self._running = False
+        if self. background_loop:
+            self.background_loop.cancel()
+            try:
+                await self.background_loop
+            except asyncio.CancelledError:
+                pass
+        
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-    def _initialize_lora_placement(self):
-        """Initialize LoRA adapter placement across instances.
-
-        等价于 dLoRA 中 find_best_lora_weight_schedule(is_init=True) 最后的
-        min_replicas = num_groups + num_models - 1 那段逻辑。
-        """
-        min_replicas = self.num_instances + self.num_loras - 1
-
-        next_instance_id = 0
-        next_lora_id = random.randint(0, self.num_loras - 1)
-        num_lora_replicas = 0
-
-        while num_lora_replicas < min_replicas:
-            # 找下一个有容量的实例
-            while len(self.instance_to_loras[next_instance_id]) >= self.num_loras:
-                next_instance_id = (next_instance_id + 1) % self.num_instances
-
-            # 找下一个没有放在该实例上的 LoRA
-            while next_lora_id in self.instance_to_loras[next_instance_id]:
-                next_lora_id = (next_lora_id + 1) % self.num_loras
-
-            self.instance_to_loras[next_instance_id].append(next_lora_id)
-            self.lora_to_instances[next_lora_id].append(next_instance_id)
-
-            self.engine_lora_capacity[next_instance_id] = len(
-                self.instance_to_loras[next_instance_id]
-            )
-
-            next_instance_id = (next_instance_id + 1) % self.num_instances
-            next_lora_id = (next_lora_id + 1) % self.num_loras
-            num_lora_replicas += 1
-
-    # -------------------------- background loop -------------------------- #
-
-    @property
     def is_running(self) -> bool:
-        """Check if background migration loop is running."""
-        return self.is_running_flag and self.background_loop is not None
+        """Check if background migration loop is running"""
+        return self._running and self.background_loop is not None
 
     def start_background_loop(self) -> None:
-        """Start the background migration loop (for PERIOD_MIG)."""
-        if self.is_running:
-            raise RuntimeError("Background loop is already running.")
+        """Start the background migration loop"""
+        if self.is_running():
+            logger.warning("Background loop already running")
+            return
+        
+        self._running = True
+        self.background_loop = asyncio.create_task(self. run_loop())
+        logger.info("Background migration loop started")
 
-        print("[EngineManager] Starting background migration loop...")
-        self.is_running_flag = True
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-
-        self.background_loop = loop.create_task(self._run_migration_loop())
-
-    def stop_background_loop(self) -> None:
-        """Stop the background migration loop."""
-        print("[EngineManager] Stopping background migration loop...")
-        self.is_running_flag = False
-        if self.background_loop:
-            self.background_loop.cancel()
-
-    async def _run_migration_loop(self):
-        """Background loop for periodic migration."""
-        while self.is_running_flag:
+    async def run_loop(self):
+        """Background loop for periodic migration"""
+        logger.info(f"Migration loop started with interval={self.migration_interval}s")
+        
+        while self._running:
             try:
-                await asyncio.sleep(self.migration_interval)
                 if self.migration_type == MigrationType.PERIOD_MIG:
-                    await self._migration_schedule()
-            except asyncio.CancelledError:
+                    await asyncio.sleep(self.migration_interval)
+                    await self._periodic_migration()
+                else:
+                    await asyncio.sleep(1.0)
+            except asyncio. CancelledError:
                 break
             except Exception as e:
-                print(f"[EngineManager] Error in migration loop: {e}")
+                logger.error(f"Error in migration loop: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+        
+        logger.info("Migration loop stopped")
 
-    # -------------------------- selection logic -------------------------- #
+    async def _periodic_migration(self):
+        """Execute periodic migration based on current load"""
+        async with self.migration_lock:
+            try:
+                # Get migration plan
+                migration_plan, need_migration = await self.migration_schedule()
+                
+                if not need_migration:
+                    logger. debug("No migration needed")
+                    return
+                
+                logger.info(f"Executing migration plan: {migration_plan}")
+                
+                # Execute migration
+                await self._execute_migration(migration_plan)
+                
+            except Exception as e:
+                logger.error(f"Error in periodic migration: {e}", exc_info=True)
 
-    async def select_instance(
-        self,
-        request_id: str,
-        lora_id: int,
+    async def get_migration_info(self) -> Tuple[Dict[int, EngineStats], bool]:
+        """
+        Collect migration info from all engines.
+        
+        Returns:
+            Tuple of (engine_stats_dict, has_data)
+        """
+        engine_stats = {}
+        session = await self._get_session()
+        
+        tasks = []
+        for engine_id in range(self.num_instances):
+            url = f"{self.instance_urls[engine_id]}/get_engine_stats"
+            tasks.append(self._fetch_engine_stats(session, engine_id, url))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        has_data = False
+        for engine_id, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger. warning(f"Failed to get stats from engine {engine_id}: {result}")
+                continue
+            
+            if result:
+                engine_stats[engine_id] = result
+                has_data = True
+        
+        return engine_stats, has_data
+
+    async def _fetch_engine_stats(
+        self, 
+        session: aiohttp. ClientSession, 
+        engine_id: int, 
+        url: str
+    ) -> Optional[EngineStats]:
+        """Fetch statistics from a single engine"""
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger. warning(f"Engine {engine_id} returned status {resp.status}")
+                    return None
+                
+                data = await resp.json()
+                
+                # Parse request metadata
+                req_metadata = []
+                for req_data in data.get("req_metadata", []):
+                    req_metadata.append(RequestMetadata(
+                        request_id=req_data["request_id"],
+                        model_id=req_data["model_id"],
+                        engine_id=engine_id,
+                        num_blocks=req_data["num_blocks"],
+                        in_gpu=req_data["in_gpu"],
+                        prompt_length=req_data.get("prompt_length", 0),
+                        output_length=req_data.get("output_length", 0),
+                    ))
+                
+                return EngineStats(
+                    engine_id=engine_id,
+                    num_requests=data["num_requests"],
+                    req_model_cnt=data["req_model_cnt"],
+                    num_free_gpu_blocks=data["num_free_gpu_blocks"],
+                    num_free_cpu_blocks=data["num_free_cpu_blocks"],
+                    lora_capacity=data["lora_capacity"],
+                    active_models=data["active_models"],
+                    req_metadata=req_metadata,
+                    model_exec_time=data.get("model_exec_time", {}),
+                )
+        except Exception as e:
+            logger.error(f"Error fetching stats from engine {engine_id}: {e}")
+            return None
+
+    async def migration_schedule(self) -> Tuple[Dict, bool]:
+        """
+        Compute migration schedule using ILP solver.
+        
+        Returns:
+            Tuple of (migration_plan, need_migration)
+            migration_plan = {
+                "req_migration": {src_engine: {dst_engine: [req_ids]}},
+                "lora_placement": {engine_id: [model_ids]}
+            }
+        """
+        # Collect current state
+        engine_stats, has_data = await self.get_migration_info()
+        
+        if not has_data or len(engine_stats) < 2:
+            return {}, False
+        
+        # Aggregate all requests
+        all_reqs_metadata = []
+        for stats in engine_stats.values():
+            all_reqs_metadata. extend(stats.req_metadata)
+        
+        if len(all_reqs_metadata) == 0:
+            logger.debug("No requests to migrate")
+            return {}, False
+        
+        # Prepare ILP inputs
+        engine_gpu_blocks = [
+            engine_stats[i].num_free_gpu_blocks 
+            for i in range(self.num_instances)
+        ]
+        engine_cpu_blocks = [
+            engine_stats[i].num_free_cpu_blocks 
+            for i in range(self.num_instances)
+        ]
+        engine_lora_capacity = [
+            self.lora_capacity_per_engine 
+            for _ in range(self.num_instances)
+        ]
+        
+        # Compute average execution time per model
+        lora_exec_time = [0.0] * self.num_models
+        for stats in engine_stats.values():
+            for model_id, (count, total_time) in stats.model_exec_time.items():
+                if count > 0:
+                    avg_time = total_time / count
+                    lora_exec_time[model_id] = max(lora_exec_time[model_id], avg_time)
+        
+        # Current model-to-engine mapping
+        model_engine_mapping = {i: [] for i in range(self.num_models)}
+        for engine_id, stats in engine_stats.items():
+            for model_id in stats.active_models:
+                model_engine_mapping[model_id].append(engine_id)
+        
+        # Solve ILP
+        try:
+            ilp_solver = MigrationILP(
+                reqs_metadata=all_reqs_metadata,
+                num_groups=self.num_instances,
+                num_models=self.num_models,
+                engine_gpu_blocks=engine_gpu_blocks,
+                engine_cpu_blocks=engine_cpu_blocks,
+                engine_lora_capacity=engine_lora_capacity,
+                lora_exec_time=lora_exec_time,
+                alpha=0.5,
+                bw=PCIE_BANDWIDTH,
+                model_engine_mapping=model_engine_mapping,
+            )
+            
+            req_migration_mapping, lora_weight_mapping, lora_weight_cnt = ilp_solver.solve()
+            
+            # Check if migration is needed
+            need_migration = False
+            for src in req_migration_mapping:
+                for dst in req_migration_mapping[src]:
+                    if len(req_migration_mapping[src][dst]) > 0:
+                        need_migration = True
+                        break
+            
+            if not need_migration:
+                logger. info("ILP solver found no beneficial migration")
+                return {}, False
+            
+            migration_plan = {
+                "req_migration": req_migration_mapping,
+                "lora_placement": lora_weight_mapping,
+            }
+            
+            logger.info(f"Migration plan computed: "
+                       f"{sum(len(v) for d in req_migration_mapping.values() for v in d.values())} requests to migrate")
+            
+            return migration_plan, True
+            
+        except Exception as e:
+            logger.error(f"Error in ILP solver: {e}", exc_info=True)
+            return {}, False
+
+    async def _execute_migration(self, migration_plan: Dict):
+        """
+        Execute the migration plan.
+        
+        Steps:
+        1. Update LoRA adapters on engines
+        2. Migrate requests between engines
+        3.  Abort old requests on source engines
+        """
+        req_migration = migration_plan. get("req_migration", {})
+        lora_placement = migration_plan.get("lora_placement", {})
+        
+        session = await self._get_session()
+        
+        # Step 1: Update LoRA adapters
+        logger.info("Step 1: Updating LoRA adapters")
+        adapter_tasks = []
+        for engine_id, model_ids in lora_placement. items():
+            url = f"{self.instance_urls[engine_id]}/adjust_lora_adapter"
+            payload = {"active": model_ids}
+            adapter_tasks.append(self._post_request(session, url, payload))
+        
+        await asyncio.gather(*adapter_tasks, return_exceptions=True)
+        
+        # Step 2: Migrate requests
+        logger.info("Step 2: Migrating requests")
+        
+        # Collect all request IDs to migrate
+        requests_to_migrate = {}  # src_engine -> [req_ids]
+        migration_targets = {}    # req_id -> dst_engine
+        
+        for src_engine in req_migration:
+            for dst_engine in req_migration[src_engine]:
+                req_ids = req_migration[src_engine][dst_engine]
+                if len(req_ids) > 0:
+                    if src_engine not in requests_to_migrate:
+                        requests_to_migrate[src_engine] = []
+                    requests_to_migrate[src_engine].extend(req_ids)
+                    
+                    for req_id in req_ids:
+                        migration_targets[req_id] = dst_engine
+        
+        if not requests_to_migrate:
+            logger.info("No requests to migrate")
+            return
+        
+        # Fetch sequence groups from source engines
+        fetch_tasks = []
+        for src_engine, req_ids in requests_to_migrate.items():
+            url = f"{self.instance_urls[src_engine]}/fetch_seq_groups"
+            payload = {"request_ids": req_ids}
+            fetch_tasks.append(self._post_request(session, url, payload))
+        
+        fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        
+        # Insert sequence groups to destination engines
+        insert_tasks = []
+        abort_tasks = []
+        
+        for idx, (src_engine, req_ids) in enumerate(requests_to_migrate. items()):
+            result = fetch_results[idx]
+            
+            if isinstance(result, Exception):
+                logger.error(f"Failed to fetch from engine {src_engine}: {result}")
+                continue
+            
+            # Group by destination engine
+            dst_groups = {}
+            for seq_group_data in result. get("seq_groups", []):
+                req_id = seq_group_data["request_id"]
+                dst_engine = migration_targets.get(req_id)
+                
+                if dst_engine is None:
+                    continue
+                
+                if dst_engine not in dst_groups:
+                    dst_groups[dst_engine] = []
+                dst_groups[dst_engine].append(seq_group_data)
+            
+            # Insert to destination engines
+            for dst_engine, seq_groups in dst_groups.items():
+                url = f"{self.instance_urls[dst_engine]}/insert_seq_groups"
+                payload = {"seq_groups": seq_groups}
+                insert_tasks.append(self._post_request(session, url, payload))
+            
+            # Abort on source engine after successful migration
+            abort_url = f"{self.instance_urls[src_engine]}/abort_requests"
+            abort_payload = {"request_ids": req_ids}
+            abort_tasks. append(self._post_request(session, abort_url, abort_payload))
+        
+        # Execute insertions and aborts
+        await asyncio. gather(*insert_tasks, return_exceptions=True)
+        await asyncio.gather(*abort_tasks, return_exceptions=True)
+        
+        # Update internal tracking
+        for req_id, dst_engine in migration_targets. items():
+            if req_id in self.request_to_engine:
+                old_engine = self.request_to_engine[req_id]
+                self.engine_request_count[old_engine] -= 1
+            
+            self.request_to_engine[req_id] = dst_engine
+            self.engine_request_count[dst_engine] += 1
+        
+        logger.info(f"Migration completed: {len(migration_targets)} requests migrated")
+
+    async def _post_request(self, session: aiohttp. ClientSession, url: str, payload: Dict):
+        """Helper to make POST request"""
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logger.warning(f"POST {url} returned status {resp.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error POST {url}: {e}")
+            return None
+
+    async def select_engine(
+        self, 
+        request_id: str, 
+        model_id: int
     ) -> Tuple[int, str]:
         """
-        Select the best instance for a request with specific LoRA.
-
-        Args:
-            request_id: Unique request identifier
-            lora_id: LoRA adapter ID
-
+        Select an engine for a new request using load balancing.
+        
+        Strategy: Least-loaded engine with the target LoRA model already loaded.
+        
         Returns:
-            (instance_id, instance_url)
+            Tuple of (engine_id, instance_url)
         """
         async with self.select_lock:
-            # 更新预期分布（类似 expected_lora_distribution[model_id] += 1）
-            if 0 <= lora_id < self.num_loras:
-                self.expected_lora_distribution[lora_id] += 1
-
-            # 更新每个实例的负载指标（当前为 mock，未来可接真实 metrics）
-            await self._update_instance_metrics()
-
-            # 如果该 LoRA 目前没有放在任何实例上，把它放到最空闲的实例上
-            if len(self.lora_to_instances[lora_id]) == 0:
-                instance_id = self.instance_num_requests.index(
-                    min(self.instance_num_requests)
-                )
-                self.lora_to_instances[lora_id] = [instance_id]
-                self.instance_to_loras[instance_id].append(lora_id)
-                print(
-                    f"[EngineManager] Adding LoRA {lora_id} to instance {instance_id}"
-                )
-
-            # DISPATCH_ONLY 情况：简单选择 cost 最小的实例
-            candidate_instances: Dict[int, float] = {}
-            for instance_id in self.lora_to_instances[lora_id]:
-                candidate_instances[instance_id] = self.instance_exec_cost.get(
-                    instance_id, 0.0
-                )
-
-            # TODO: 如果想支持 DISPATCH_MIG，可以在这里实现“替换某个 LoRA”逻辑，
-            # 对齐原 dLoRA 的 EngineManager.select_engine 内的 sub_engine_model_ids 分支。
-
-            # 在候选实例中选 execution cost 最小的
-            min_cost = math.inf
-            min_instance_id = None
-            for instance_id, cost in candidate_instances.items():
-                if cost < min_cost:
-                    min_cost = cost
-                    min_instance_id = instance_id
-
-            if min_instance_id is None:
-                # 兜底：如果上面没有选出，就选请求数最少的实例
-                min_instance_id = self.instance_num_requests.index(
-                    min(self.instance_num_requests)
-                )
-
-            return min_instance_id, self.instance_urls[min_instance_id]
-
-    async def _update_instance_metrics(self):
-        """Update metrics for all instances.
-
-        目前是 mock 数据：
-          - 对每个实例中已放置的 LoRA，随机生成该 LoRA 的请求数
-          - 根据 dLoRA 论文中的合并代价模型估算 instance_exec_cost
-        将来可以改成：
-          - 请求每个 SGLang 实例的 /metrics HTTP 接口
-          - 使用真实的 req_lora_cnt、num_free_blocks 等指标
-        """
-        for instance_id in range(self.num_instances):
-            # Mock: 每个 LoRA 在该实例上的请求数
-            req_lora_cnt: Dict[int, int] = {}
-            for lora_id in self.instance_to_loras[instance_id]:
-                req_lora_cnt[lora_id] = random.randint(0, 20)
-
-            self.instance_req_lora_cnt[instance_id] = req_lora_cnt
-
-            # 按 dLoRA 的方式计算执行开销：批量合并 + merge_speed_ratio
-            cost = 0.0
-            res_cnt = 0
-            for _, cnt in req_lora_cnt.items():
-                res_cnt += cnt % self.max_loras_per_batch
-                cost += (cnt // self.max_loras_per_batch) * self.merge_speed_ratio
-            cost += res_cnt // self.max_loras_per_batch
-
-            self.instance_exec_cost[instance_id] = cost
-            self.instance_num_requests[instance_id] = sum(req_lora_cnt.values())
-
-    # -------------------------- migration logic -------------------------- #
-
-    def _get_migration_info(self) -> bool:
-        """
-        Collect migration information from all instances.
-
-        Returns:
-            True if migration is needed, False otherwise
-        """
-        need_migration = False
-        self.reqs_metadata = {}
-        self.lora_exec_info = {i: (0, 0.0) for i in range(self.num_loras)}
-
-        # 这里暂时没有真实 request-level Metadata，只用 instance_num_requests 做触发判断。
-        for instance_id in range(self.num_instances):
-            num_reqs = self.instance_num_requests[instance_id]
-            if num_reqs > self.max_loras_per_batch:
-                need_migration = True
-
-            # 占位：可以在后续从 /metrics 中获取真实的 RequestMetadata
-            self.reqs_metadata[instance_id] = []
-
-            # 统计 LoRA 执行信息
-            for lora_id in self.instance_to_loras[instance_id]:
-                exec_cnt = self.instance_req_lora_cnt[instance_id].get(lora_id, 0)
-                current_cnt, current_time = self.lora_exec_info[lora_id]
-                self.lora_exec_info[lora_id] = (
-                    current_cnt + exec_cnt,
-                    current_time + exec_cnt * self.default_exec_time,
-                )
-
-        # 计算平均执行时间
-        self.lora_avg_exec_time = []
-        for lora_id in range(self.num_loras):
-            cnt, total_time = self.lora_exec_info[lora_id]
-            if cnt > 0:
-                self.lora_avg_exec_time.append(total_time / cnt)
+            # Update global model request count
+            self.global_model_request_count[model_id] = \
+                self.global_model_request_count.get(model_id, 0) + 1
+            
+            # Get current engine stats
+            engine_stats, has_data = await self.get_migration_info()
+            
+            if not has_data:
+                # Fallback: round-robin
+                engine_id = len(self.request_to_engine) % self.num_instances
+                logger.warning(f"No stats available, using round-robin: engine {engine_id}")
             else:
-                self.lora_avg_exec_time.append(self.default_exec_time)
-
-        return need_migration
-
-    async def _migration_schedule(self):
-        """Execute periodic migration scheduling using ILP (for PERIOD_MIG)."""
-        async with self.select_lock:
-            need_migration = self._get_migration_info()
-
-            if not need_migration:
-                print("[EngineManager] No migration needed")
-                return
-
-            # 根据 reqs_metadata 看各实例的 request 数（占位：目前为 0）
-            instance_req_cnt = {
-                i: len(reqs) for i, reqs in self.reqs_metadata.items()
-            }
-            num_reqs = sum(instance_req_cnt.values())
-
-            if num_reqs == 0:
-                # 目前没有真实的 request metadata，不做迁移
-                print("[EngineManager] No request metadata, skip migration")
-                return
-
-            # 按请求数从大到小排序，找最忙实例
-            instance_req_cnt = sorted(
-                instance_req_cnt.items(), key=lambda x: x[1], reverse=True
-            )
-
-            matched_instances: List[int] = []
-            remaining_instances = list(instance_req_cnt)
-
-            while remaining_instances:
-                avg_num_reqs = num_reqs / len(remaining_instances)
-                most_req_instance_id, most_req_instance_cnt = remaining_instances.pop(0)
-                num_reqs -= most_req_instance_cnt
-                delta = most_req_instance_cnt - avg_num_reqs
-
-                if delta < self.migration_req_threshold:
-                    return
-
-                # 找负载较轻的实例
-                for instance_id, cnt in remaining_instances:
-                    if delta <= 0 or len(matched_instances) > 0:
-                        break
-                    to_fill = avg_num_reqs - cnt
-                    if to_fill <= 0:
-                        break
-                    to_fill = min(to_fill, delta)
-                    matched_instances.append(instance_id)
-                    delta -= to_fill
-
-                if matched_instances:
-                    break
-
-            if not matched_instances:
-                return
-
-            print(
-                f"[EngineManager] Migration: Instance {most_req_instance_id} -> {matched_instances}"
-            )
-
-            await self._execute_ilp_migration(most_req_instance_id, matched_instances)
-
-    async def _execute_ilp_migration(
-        self,
-        src_instance: int,
-        dst_instances: List[int],
-    ):
-        """
-        Execute ILP-based migration between instances.
-
-        NOTE: 当前版本只更新 LoRA <-> 实例 映射，不做真正的 request-level 迁移，
-        即：只影响后续请求的路由，不会把已经在跑的请求从一个实例迁走。
-        """
-        ilp_engines = sorted([src_instance] + dst_instances)
-        ilp_engine_mapping = {ilp_engines[i]: i for i in range(len(ilp_engines))}
-
-        # 收集参与迁移的 LoRA 集合
-        ilp_loras = set()
-        for engine_id in ilp_engines:
-            for lora_id in self.instance_to_loras[engine_id]:
-                ilp_loras.add(lora_id)
-        ilp_loras = sorted(list(ilp_loras))
-        ilp_lora_mapping = {ilp_loras[i]: i for i in range(len(ilp_loras))}
-
-        # 目前 reqs_metadata 全是空的，占位逻辑
-        ilp_reqs_metadata: List[RequestMetadata] = []
-        for engine_id in ilp_engines:
-            for req_metadata in self.reqs_metadata[engine_id]:
-                req_metadata.engine_id = ilp_engine_mapping[engine_id]
-                req_metadata.model_id = ilp_lora_mapping[req_metadata.model_id]
-            ilp_reqs_metadata.extend(self.reqs_metadata[engine_id])
-
-        # ILP 参数
-        ilp_num_instances = len(ilp_engines)
-        ilp_num_loras = len(ilp_loras)
-        ilp_num_gpu_blocks = [self.num_gpu_blocks[e] for e in ilp_engines]
-        ilp_num_cpu_blocks = [self.num_cpu_blocks[e] for e in ilp_engines]
-        ilp_lora_capacity = [len(self.instance_to_loras[e]) for e in ilp_engines]
-        ilp_lora_avg_exec_time = [
-            self.lora_avg_exec_time[lora_id] for lora_id in ilp_loras
-        ]
-
-        # 构建 LoRA -> engine 的初始映射
-        ilp_lora_to_instances: Dict[int, List[int]] = {i: [] for i in range(ilp_num_loras)}
-        for engine_id, lora_ids in self.instance_to_loras.items():
-            if engine_id not in ilp_engines:
-                continue
-            for lora_id in lora_ids:
-                if lora_id in ilp_lora_mapping:
-                    ilp_lora_to_instances[ilp_lora_mapping[lora_id]].append(
-                        ilp_engine_mapping[engine_id]
+                # Find least-loaded engine with model loaded
+                candidates = []
+                
+                for eid, stats in engine_stats. items():
+                    # Check if model is loaded
+                    has_model = model_id in stats.active_models
+                    
+                    # Check capacity
+                    has_capacity = stats.num_requests < self.max_running_requests
+                    
+                    if has_capacity:
+                        # Prefer engines with model already loaded
+                        priority = stats.num_requests if has_model else (stats.num_requests + 1000)
+                        candidates.append((priority, eid))
+                
+                if candidates:
+                    candidates.sort()
+                    engine_id = candidates[0][1]
+                else:
+                    # All engines full, use least loaded
+                    engine_id = min(
+                        engine_stats.keys(), 
+                        key=lambda eid: engine_stats[eid].num_requests
                     )
+                
+                logger.debug(f"Selected engine {engine_id} for model {model_id} "
+                           f"(num_requests={engine_stats[engine_id].num_requests})")
+            
+            # Track request
+            self.request_to_engine[request_id] = engine_id
+            self.engine_request_count[engine_id] += 1
+            self.engine_active_models[engine_id]. add(model_id)
+            
+            return engine_id, self.instance_urls[engine_id]
 
-        print(
-            f"[EngineManager] Solving ILP with {len(ilp_reqs_metadata)} requests, "
-            f"{ilp_num_instances} instances, {ilp_num_loras} LoRAs..."
-        )
-        migration_ilp = MigrationILP(
-            reqs_metadata=ilp_reqs_metadata,
-            num_groups=ilp_num_instances,
-            num_models=ilp_num_loras,
-            engine_gpu_blocks=ilp_num_gpu_blocks,
-            engine_cpu_blocks=ilp_num_cpu_blocks,
-            engine_lora_capacity=ilp_lora_capacity,
-            lora_exec_time=ilp_lora_avg_exec_time,
-            alpha=0.1,
-            bw=PCIE_BANDWIDTH / self.default_exec_time,
-            model_engine_mapping=ilp_lora_to_instances,
-        )
-
-        req_migration_decision, lora_migration_decision, lora_weight_cnt = (
-            migration_ilp.solve()
-        )
-
-        if req_migration_decision is None:
-            print("[EngineManager] ILP migration failed")
-            return
-
-        print("[EngineManager] Applying migration decisions...")
-        for src_id, decision in req_migration_decision.items():
-            src_eng = ilp_engines[src_id]
-            for dst_id, req_ids in decision.items():
-                dst_eng = ilp_engines[dst_id]
-                if req_ids:
-                    print(
-                        f"  - (placeholder) move {len(req_ids)} requests from {src_eng} to {dst_eng}"
-                    )
-                    # TODO: 如果将来 SGLang 暴露 request-level 管理 API，可在这里真正迁移正在执行的请求。
-
-        # 更新 LoRA -> 实例映射
-        for engine_id, lora_ids in lora_migration_decision.items():
-            real_engine_id = ilp_engines[engine_id]
-            self.instance_to_loras[real_engine_id] = [
-                ilp_loras[lora_id] for lora_id in lora_ids
-            ]
-
-        # 重建 lora_to_instances
-        self.lora_to_instances = {i: [] for i in range(self.num_loras)}
-        for engine_id, lora_ids in self.instance_to_loras.items():
-            for lora_id in lora_ids:
-                self.lora_to_instances[lora_id].append(engine_id)
-
-        print(f"[EngineManager] Migration completed")
-        print(f"  - New LoRA placement: {self.instance_to_loras}")
-
-    # -------------------------- statistics -------------------------- #
+    async def complete_request(self, request_id: str):
+        """Mark a request as completed"""
+        if request_id in self.request_to_engine:
+            engine_id = self.request_to_engine. pop(request_id)
+            self.engine_request_count[engine_id] -= 1
 
     def get_stats(self) -> Dict:
-        """Get current manager statistics."""
+        """Get current manager statistics"""
         return {
             "num_instances": self.num_instances,
-            "num_loras": self.num_loras,
-            "instance_requests": self.instance_num_requests,
-            "lora_placement": self.instance_to_loras,
-            "instance_exec_cost": self.instance_exec_cost,
-            "migration_type": self.migration_type.name,
-            "exec_type": self.exec_type.name,
+            "num_models": self.num_models,
+            "total_requests": len(self.request_to_engine),
+            "engine_request_count": self.engine_request_count,
+            "global_model_request_count": self.global_model_request_count,
+            "migration_type": self.migration_type. name,
         }
-
-
-def create_engine_manager(
-    backend: str,
-    num_instances: int,
-    num_loras: int,
-    base_url: str,
-    base_port: int,
-    **kwargs,
-) -> EngineManager:
-    """
-    Factory for EngineManager, 模仿 dLoRA 的构造接口，但适配 HTTP 实例。
-
-    Args:
-        backend: 'sglang' or 'dlora'（目前只影响日志）
-        num_instances: Number of SGLang instances
-        num_loras: Number of LoRA adapters
-        base_url: Base URL, e.g. "127.0.0.1"
-        base_port: Starting port, e.g. 30001
-        **kwargs: Extra args for EngineManager (exec_type, migration_type, ...)
-
-    Returns:
-        EngineManager instance.
-    """
-    instance_urls = [f"http://{base_url}:{base_port + i}" for i in range(num_instances)]
-
-    exec_type = kwargs.pop("exec_type", ExecType.LORA)
-    migration_type = kwargs.pop("migration_type", MigrationType.PERIOD_MIG)
-
-    return EngineManager(
-        exec_type=exec_type,
-        migration_type=migration_type,
-        num_instances=num_instances,
-        num_loras=num_loras,
-        instance_urls=instance_urls,
-        **kwargs,
-    )

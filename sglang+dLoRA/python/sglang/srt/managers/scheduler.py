@@ -112,6 +112,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    # Add new imports
+    GetEngineStatsReqInput,
+    GetEngineStatsReqOutput,
+    FetchSeqGroupsReqInput,
+    FetchSeqGroupsReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -193,6 +198,8 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -565,6 +572,9 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
+                # Add new handlers
+                (GetEngineStatsReqInput, self.get_engine_stats),
+                (FetchSeqGroupsReqInput, self.fetch_seq_groups),
             ]
         )
 
@@ -2428,6 +2438,97 @@ class Scheduler(
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+        
+    
+    def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
+        # Calculate free blocks
+        # SGLang's TokenToKVPoolAllocator uses available_size()
+        num_free_gpu_blocks = self.token_to_kv_pool_allocator.available_size()
+        
+        # CPU allocator might not exist or be different, assuming 0 for now if not present
+        num_free_cpu_blocks = 0 
+        
+        # Collect request stats
+        num_requests = len(self.waiting_queue) + len(self.running_batch.reqs)
+        
+        req_model_cnt = defaultdict(int)
+        req_metadata = []
+        
+        # Helper to process requests
+        def process_req(req, in_gpu):
+            # Extract model ID from lora_path or lora_id
+            # Assuming lora_id is like "lora1", "lora2" or int
+            model_id = 0
+            if req.lora_id:
+                try:
+                    if isinstance(req.lora_id, int):
+                        model_id = req.lora_id
+                    elif isinstance(req.lora_id, str) and "lora" in req.lora_id:
+                        model_id = int(req.lora_id.replace("lora", ""))
+                except:
+                    pass
+            
+            req_model_cnt[model_id] += 1
+            
+            # Estimate blocks (simplified)
+            # For waiting requests, output_ids is empty.
+            # We use input length + max_new_tokens estimate or just input
+            current_len = len(req.origin_input_ids) + len(req.output_ids)
+            num_blocks = (current_len + self.page_size - 1) // self.page_size
+            
+            req_metadata.append({
+                "request_id": req.rid,
+                "model_id": model_id,
+                "num_blocks": num_blocks,
+                "in_gpu": in_gpu,
+                "prompt_length": len(req.origin_input_ids),
+                "output_length": len(req.output_ids)
+            })
+
+        for req in self.running_batch.reqs:
+            process_req(req, True)
+            
+        for req in self.waiting_queue:
+            process_req(req, False)
+
+        return GetEngineStatsReqOutput(
+            num_requests=num_requests,
+            req_model_cnt=dict(req_model_cnt),
+            num_free_gpu_blocks=num_free_gpu_blocks,
+            num_free_cpu_blocks=num_free_cpu_blocks,
+            req_metadata=req_metadata
+        )
+
+    def fetch_seq_groups(self, recv_req: FetchSeqGroupsReqInput):
+        """
+        Fetch and remove requests from the waiting queue.
+        """
+        target_rids = set(recv_req.request_ids)
+        seq_groups_data = []
+        new_waiting_queue = []
+        
+        for req in self.waiting_queue:
+            if req.rid in target_rids:
+                # Serialize request data
+                seq_data = {
+                    "request_id": req.rid,
+                    "prompt": req.origin_input_text,
+                    "prompt_token_ids": req.origin_input_ids,
+                    "sampling_params": req.sampling_params.to_dict() if hasattr(req.sampling_params, "to_dict") else req.sampling_params.__dict__,
+                    "lora_path": req.lora_path,
+                    "arrival_time": req.arrival_time,
+                    "image_data": req.image_data, # Pass through if exists
+                    "modalities": req.modalities,
+                }
+                seq_groups_data.append(seq_data)
+            else:
+                new_waiting_queue.append(req)
+        
+        # Update waiting queue (remove migrated requests)
+        self.waiting_queue = new_waiting_queue
+        
+        return FetchSeqGroupsReqOutput(seq_groups=seq_groups_data)
+    
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
@@ -2755,7 +2856,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    # Generate the logger prefix
+    # Generate the logger prefix # 生成日志前缀（用于区分不同 rank 的进程日志）
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
@@ -2797,7 +2898,7 @@ def run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
-    # Create a scheduler and run the event loop
+    # Create a scheduler and run the event loop # 创建 Scheduler 实例，并进入主事件循环
     try:
         scheduler = Scheduler(
             server_args,
@@ -2808,6 +2909,7 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        # 向父进程（主控进程）发送“就绪”信号和部分能力参数
         pipe_writer.send(
             {
                 "status": "ready",

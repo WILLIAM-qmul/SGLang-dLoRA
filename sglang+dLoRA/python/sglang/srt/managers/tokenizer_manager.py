@@ -66,6 +66,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
+    # Add new imports
+    GetEngineStatsReqInput,
+    GetEngineStatsReqOutput,
+    FetchSeqGroupsReqInput,
+    FetchSeqGroupsReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -398,48 +403,69 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                # Add handlers for new outputs
+                (GetEngineStatsReqOutput, self._handle_get_engine_stats_output),
+                (FetchSeqGroupsReqOutput, self._handle_fetch_seq_groups_output),
             ]
         )
         self.init_communicators(server_args)
+        
+        # Futures for async requests
+        self.engine_stats_future = None
+        self.fetch_seq_groups_future = None
 
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        # 记录请求创建时间（用于后续统计和日志）
         created_time = time.time()
+        # 自动创建并绑定事件循环（保证异步任务正常运行）
         self.auto_create_handle_loop()
+        # 规范化批量和参数（如 batch_size、sampling_params 等）
         obj.normalize_batch_and_arguments()
 
+        # 如果 HTTP 请求头中有 trace_context，则设置分布式链路追踪上下文
         if request and "trace_context" in request.headers:
             trace_set_remote_propagate_context(request.headers["trace_context"])
 
+        # 多分词器模式下，附加 HTTP worker 信息到请求对象
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
+        # 如果启用 trace，则记录请求开始的 trace 信息
         if self.enable_trace:
             self._trace_request_start(obj, created_time)
 
+        # 如果启用请求日志，则打印请求内容（截断长文本）
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+        # 等待分词器处于非暂停状态（如权重更新期间会暂停）
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
+        # 权重更新期间加读锁，保证推理和权重更新互斥
         async with self.model_update_lock.reader_lock:
+            # 如果启用 LoRA 且请求指定了 lora_path，则查找 LoRA ID 并标记正在处理 LoRA 请求
             if self.server_args.enable_lora and obj.lora_path:
-                # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
+            # 单请求模式
             if obj.is_single:
+                # 分词处理，得到 tokenized_obj
                 tokenized_obj = await self._tokenize_one_request(obj)
+                # 发送请求到 Scheduler，并创建请求状态
                 state = self._send_one_request(obj, tokenized_obj, created_time)
+                # 异步等待 Scheduler 返回结果，逐步 yield 响应（支持流式）
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
+                # 批量请求模式，异步处理每个请求并 yield 响应
                 async for response in self._handle_batch_request(
                     obj, request, created_time
                 ):
@@ -934,6 +960,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         created_time: Optional[float] = None,
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        """将一批已分词的请求作为一个批量请求发送到调度器（Scheduler）"""
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
@@ -996,11 +1023,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        if not obj.stream:
-                            raise ValueError(finish_reason["message"])
-                        else:
-                            yield out
-                            break
+                        raise ValueError(finish_reason["message"])
 
                     if finish_reason.get("type") == "abort" and finish_reason.get(
                         "status_code"
@@ -1017,14 +1040,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-                        if not obj.stream:
-                            raise fastapi.HTTPException(
-                                status_code=finish_reason["status_code"],
-                                detail=finish_reason["message"],
-                            )
-                        else:
-                            yield out
-                            break
+
+                        raise fastapi.HTTPException(
+                            status_code=finish_reason["status_code"],
+                            detail=finish_reason["message"],
+                        )
                 yield out
                 break
 
@@ -1055,16 +1075,21 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         request: Optional[fastapi.Request] = None,
         created_time: Optional[float] = None,
     ):
-        batch_size = obj.batch_size
+        batch_size = obj.batch_size  # 获取批量请求的大小
 
-        generators = []
-        rids = []
+        generators = []  # 用于存储每个请求的异步响应生成器
+        rids = []        # 用于存储每个请求的唯一请求 ID
+
+        # 如果没有并行采样（parallel_sample_num == 1）
         if getattr(obj, "parallel_sample_num", 1) == 1:
+            # 判断是否需要批量分词（如显式开启或所有请求都已分词/无文本）
             if self._should_use_batch_tokenization(batch_size, obj):
+                # 批量分词并处理，得到所有 tokenized 请求对象
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                # 批量发送请求到 Scheduler
                 self._send_batch_request(obj, tokenized_objs, created_time)
 
-                # Set up generators for each request in the batch
+                # 为每个请求设置异步响应生成器
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     generators.append(
@@ -1074,7 +1099,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     )
                     rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing
+                # 顺序分词和处理（逐个分词、发送、等待响应）
                 with (
                     input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
                     if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
@@ -1082,16 +1107,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
+                        # 分词处理
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        # 发送请求到 Scheduler
                         state = self._send_one_request(
                             tmp_obj, tokenized_obj, created_time
                         )
+                        # 设置异步响应生成器
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
                         )
                         rids.append(tmp_obj.rid)
         else:
-            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+            # 如果并行采样数大于 1（如 n > 1），需要特殊处理
+            # 性能警告：大批量并行采样未优化
             if batch_size > 128:
                 logger.warning(
                     "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
@@ -1099,13 +1128,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "many threads to send them one by one with parallel sampling (n > 1)."
                 )
 
-            # Tokenize all requests
+            # 先分词所有请求
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
+            # 缓存公共前缀（用于并行采样，先发一遍 max_new_tokens=0 的请求）
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
@@ -1116,7 +1145,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 await self._wait_one_response(tmp_obj, state, request).__anext__()
 
-            # Expand requests, assign new rids for them, and send them
+            # 展开请求，分配新的 rid 并发送
             for i in range(batch_size):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
@@ -1126,15 +1155,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
-        # Wait for all requests
-        is_stream = hasattr(obj, "stream") and obj.stream
+        # 等待所有请求的结果
+        is_stream = hasattr(obj, "stream") and obj.stream  # 是否为流式输出
         if not is_stream:
+            # 非流式：一次性收集所有结果并 yield
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
+            # 流式：每次有结果就 yield，直到所有请求结束
+            rid_to_index = {rid: i for i, rid in enumerate(rids)}  # rid 到索引的映射
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
+                # 等待任意一个请求完成
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
                 )
@@ -1143,12 +1175,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
+                        # 标记结果属于第几个请求
                         result["index"] = rid_to_index[result["meta_info"]["id"]]
                         yield result
+                        # 继续监听该请求的下一个结果
                         new_task = asyncio.create_task(gen.__anext__())
                         task_map[new_task] = gen
                     except StopAsyncIteration:
-                        pass
+                        pass  # 请求已结束，移除
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -1218,6 +1252,28 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
+        
+    
+    async def get_engine_stats(self):
+        """Send request to scheduler to get engine stats."""
+        self.engine_stats_future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(GetEngineStatsReqInput())
+        return await self.engine_stats_future
+
+    def _handle_get_engine_stats_output(self, recv_obj: GetEngineStatsReqOutput):
+        if self.engine_stats_future and not self.engine_stats_future.done():
+            self.engine_stats_future.set_result(recv_obj)
+
+    async def fetch_seq_groups(self, request_ids: List[str]):
+        """Send request to scheduler to fetch sequence groups."""
+        self.fetch_seq_groups_future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(FetchSeqGroupsReqInput(request_ids=request_ids))
+        return await self.fetch_seq_groups_future
+
+    def _handle_fetch_seq_groups_output(self, recv_obj: FetchSeqGroupsReqOutput):
+        if self.fetch_seq_groups_future and not self.fetch_seq_groups_future.done():
+            self.fetch_seq_groups_future.set_result(recv_obj)
+    
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:

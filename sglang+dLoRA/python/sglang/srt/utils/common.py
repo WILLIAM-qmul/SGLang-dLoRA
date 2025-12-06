@@ -1128,14 +1128,20 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    # 如果环境变量 SGLANG_USE_MODELSCOPE 被设置为 true，则使用 ModelScope 平台下载模型和分词器
     if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        # 如果本地不存在模型路径，则需要从 ModelScope 下载
         if not os.path.exists(model_path):
+            # 延迟导入 modelscope 库，避免无用依赖
             from modelscope import snapshot_download
 
+            # 下载模型文件到本地，返回实际的本地路径
             model_path = snapshot_download(model_path)
+            # 下载分词器文件到本地，忽略 .bin 和 .safetensors 文件（只下载分词器相关文件）
             tokenizer_path = snapshot_download(
                 tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
             )
+    # 返回最终的模型路径和分词器路径（本地路径）
     return model_path, tokenizer_path
 
 
@@ -1831,8 +1837,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
             "."
         )
-        # Currently XPU version does not contain capability information.
-        major, minor = None, None
+        major, minor = int(major), int(minor)
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:

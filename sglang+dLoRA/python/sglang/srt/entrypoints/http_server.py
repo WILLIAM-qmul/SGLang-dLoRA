@@ -318,6 +318,22 @@ app.add_middleware(
 )
 
 
+from sglang.srt.entrypoints.http_server_extensions import (
+    get_engine_stats,
+    fetch_seq_groups,
+    insert_seq_groups,
+    abort_requests,
+    adjust_lora_adapter,
+)
+
+# Register new routes
+app.add_api_route("/get_engine_stats", get_engine_stats, methods=["GET"])
+app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
+app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])
+app.add_api_route("/abort_requests", abort_requests, methods=["POST"])
+app.add_api_route("/adjust_lora_adapter", adjust_lora_adapter, methods=["POST"])
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -531,24 +547,30 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # 如果请求参数中指定了流式输出
     if obj.stream:
-
+        # 定义一个异步生成器，用于逐步返回生成结果
         async def stream_results() -> AsyncIterator[bytes]:
             try:
+                # 异步迭代生成器，逐步获取生成结果
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
+                    # 每次输出都以 SSE 格式返回（data: ...\n\n）
                     yield b"data: " + orjson.dumps(
                         out, option=orjson.OPT_NON_STR_KEYS
                     ) + b"\n\n"
             except ValueError as e:
+                # 捕获生成过程中的异常，返回错误信息
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
+            # 生成结束，发送 [DONE] 标记
             yield b"data: [DONE]\n\n"
 
+        # 返回 StreamingResponse，使用 text/event-stream 进行流式推送
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -556,11 +578,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
+            # 非流式，直接获取生成结果（只取第一个结果）
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
             return ret
         except ValueError as e:
+            # 捕获异常，返回错误响应
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
@@ -1354,6 +1378,27 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    """
+        启动 SRT（SGLang Runtime）服务器。
+
+        SRT 服务器由一个 HTTP 服务器和一个 SRT 引擎组成。
+
+        - HTTP 服务器：一个 FastAPI 服务器，将请求路由到引擎。
+        - 引擎由三个组件组成：
+            1. TokenizerManager：对请求进行分词并发送给调度器。
+            2. Scheduler（子进程）：从 Tokenizer Manager 接收请求，调度批处理，转发请求，并将输出 token 发送给 Detokenizer Manager。
+            3. DetokenizerManager（子进程）：对输出 token 进行去分词处理，并将结果返回给 Tokenizer Manager。
+
+        注意事项：
+        1. HTTP 服务器、引擎和 TokenizerManager 都运行在主进程中。
+        2. 进程间通信通过 IPC（每个进程使用不同端口）和 ZMQ 库实现。
+    """
+    '''
+    1. 初始化核心组件：调用 _launch_subprocesses 启动 TokenizerManager（主进程）、Scheduler（子进程）、DetokenizerManager（子进程），并分配进程间通信端口。
+    2. 设置全局状态：通过 set_global_state 把这些组件注册到全局，供后续 API 调用。
+    3. 配置 FastAPI 应用：根据单/多分词器模式，设置 app 的相关属性和中间件（如 API Key 校验）。
+    4. 启动 HTTP 服务：调用 uvicorn.run 启动 FastAPI HTTP 服务器，监听外部请求。
+    '''
     tokenizer_manager, template_manager, scheduler_info, port_args = (
         _launch_subprocesses(server_args=server_args)
     )
