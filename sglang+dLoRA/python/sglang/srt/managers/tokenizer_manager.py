@@ -457,6 +457,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # 单请求模式
             if obj.is_single:
+                logger.info("Processing single request")
                 # 分词处理，得到 tokenized_obj
                 tokenized_obj = await self._tokenize_one_request(obj)
                 # 发送请求到 Scheduler，并创建请求状态
@@ -465,6 +466,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
+                logger.info("Processing batch request")
                 # 批量请求模式，异步处理每个请求并 yield 响应
                 async for response in self._handle_batch_request(
                     obj, request, created_time
@@ -1254,6 +1256,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return all_success, all_message, all_paused_requests
         
     
+    # Add to TokenizerManager class in sglang/srt/managers/tokenizer_manager.py
+
     async def get_engine_stats(self):
         """Send request to scheduler to get engine stats."""
         self.engine_stats_future = asyncio.Future()
@@ -1261,6 +1265,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         return await self.engine_stats_future
 
     def _handle_get_engine_stats_output(self, recv_obj: GetEngineStatsReqOutput):
+        """Handle response from scheduler"""
         if self.engine_stats_future and not self.engine_stats_future.done():
             self.engine_stats_future.set_result(recv_obj)
 
@@ -1271,9 +1276,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         return await self.fetch_seq_groups_future
 
     def _handle_fetch_seq_groups_output(self, recv_obj: FetchSeqGroupsReqOutput):
+        """Handle response from scheduler"""
         if self.fetch_seq_groups_future and not self.fetch_seq_groups_future.done():
             self.fetch_seq_groups_future.set_result(recv_obj)
-    
+
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:

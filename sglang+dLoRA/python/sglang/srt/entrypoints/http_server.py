@@ -318,7 +318,10 @@ app.add_middleware(
 )
 
 
-from sglang.srt.entrypoints.http_server_extensions import (
+# File: sglang+dLoRA/python/sglang/srt/entrypoints/http_server.py
+
+# ... existing imports ... 
+from sglang.srt. entrypoints.http_server_extensions import (
     get_engine_stats,
     fetch_seq_groups,
     insert_seq_groups,
@@ -326,7 +329,9 @@ from sglang.srt.entrypoints.http_server_extensions import (
     adjust_lora_adapter,
 )
 
-# Register new routes
+# ... existing code ... 
+
+# Add these routes after existing route definitions
 app.add_api_route("/get_engine_stats", get_engine_stats, methods=["GET"])
 app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
 app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])

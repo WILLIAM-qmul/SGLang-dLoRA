@@ -21,7 +21,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -1563,10 +1563,15 @@ class GetEngineStatsReqInput(BaseReq):
 @dataclass
 class GetEngineStatsReqOutput(BaseReq):
     num_requests: int
-    req_model_cnt: Dict[int, int]
-    num_free_gpu_blocks: int
-    num_free_cpu_blocks: int
-    req_metadata: List[Dict]  # List of dicts representing RequestMetadata
+    req_model_cnt: Dict[str, int]
+    num_free_gpu_pages: int
+    req_metadata: List[Dict]
+    lora_capacity: int
+    active_models: List[str]
+    available_gpu_memory: float
+    cache_page_size: int
+    lora_weight_size: int
+    model_exec_time: Dict[int, Tuple[int, float]] = field(default_factory=dict)
 
 @dataclass
 class FetchSeqGroupsReqInput(BaseReq):
