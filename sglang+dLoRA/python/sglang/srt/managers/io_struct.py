@@ -1579,30 +1579,6 @@ class GetReqModelCntReqOutput(BaseReq):
     total_requests: int = 0
     exec_cost: float = 0.0
 
-@dataclass
-class GetEngineStatsReqInput(BaseReq):
-    pass
-
-@dataclass
-class GetEngineStatsReqOutput(BaseReq):
-    num_requests: int
-    req_model_cnt: Dict[str, int]
-    num_free_gpu_pages: int
-    req_metadata: List[Dict]
-    lora_capacity: int
-    available_gpu_memory: float
-    cache_page_size: int
-    model_exec_time: Dict[int, Tuple[int, float]] = field(default_factory=dict)
-    # active_models: List[str]
-
-@dataclass
-class FetchSeqGroupsReqInput(BaseReq):
-    request_ids: List[str]
-
-@dataclass
-class FetchSeqGroupsReqOutput(BaseReq):
-    seq_groups: List[Dict]  # List of serialized sequence groups
-
 # ...existing code...
 
 

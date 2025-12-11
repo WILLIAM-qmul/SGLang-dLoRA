@@ -464,7 +464,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # 单请求模式
             if obj.is_single:
-                logger.info("Processing single request")
+                # TODO: 单请求逻辑
+                # NOTE: 走单请求 if 分支
                 # 分词处理，得到 tokenized_obj
                 tokenized_obj = await self._tokenize_one_request(obj)
                 # 发送请求到 Scheduler，并创建请求状态
@@ -473,7 +474,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
-                logger.info("Processing batch request")
                 # 批量请求模式，异步处理每个请求并 yield 响应
                 async for response in self._handle_batch_request(
                     obj, request, created_time
@@ -623,41 +623,60 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
-        # Tokenize
+
+        # 初始化嵌入向量为 None（如果请求包含 input_embeds，则后续赋值）
         input_embeds = None
+
+        # 获取请求中的原始文本内容
         input_text = obj.text
+
+        # 初始化 token_type_ids（仅用于 cross-encoder 模型）
         token_type_ids = None
+
+        # 判断是否为 cross-encoder 请求（用于句对任务）
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+
+        # 如果请求直接提供了 input_embeds（嵌入向量）
         if obj.input_embeds is not None:
+            # 检查是否允许使用嵌入输入（需关闭 radix cache）
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
+            # 赋值嵌入向量和 input_ids（通常 input_ids 也会被提供）
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
+
+        # 如果请求直接提供了 input_ids（已分词的 token 序列）
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
+
+        # 否则，需要对文本进行分词处理
         else:
+            # 如果分词器未初始化，报错
             if self.tokenizer is None:
                 raise ValueError(
                     "The engine initialized with skip_tokenizer_init=True cannot "
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-
+            # 调用分词方法，得到 input_ids 和 token_type_ids（如有）
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
             )
 
+        # 如果启用了多模态处理器且请求包含多模态输入（如图片或音频）
         if self.mm_processor and obj.contains_mm_input():
+            # 保证 image_data/audio_data 都是列表格式
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            # 多模态数据处理，得到 mm_inputs（可能包含新的 input_ids）
             mm_inputs: Dict = await self.mm_data_processor.process(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
@@ -665,13 +684,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
+            # 如果多模态处理结果中包含 input_ids，则覆盖原有 input_ids
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
         else:
             mm_inputs = None
 
+        # 校验请求是否合法（如 token 数量是否超限等）
         self._validate_one_request(obj, input_ids)
+
+        # 记录分词阶段结束的 trace（用于性能分析和链路追踪）
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
+
+        # 构造并返回分词后的请求对象（包含所有必要信息）
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -949,15 +974,30 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        # 开始记录分词器分发阶段的 trace（用于性能分析和链路追踪）
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
+
+        # 将 trace 上下文信息绑定到 tokenized_obj（用于分布式链路追踪）
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+
+        # 通过 ZeroMQ 发送已分词的请求对象到 Scheduler（调度器进程）
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+
+        # 创建请求状态对象 ReqState，保存请求的相关信息和异步事件
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+
+        # 记录请求被调度的时间戳（用于后续性能统计）
         state.request_scheduled_ts = time.time()
+
+        # 将请求状态对象存入 rid_to_state 字典，便于后续查找和管理
         self.rid_to_state[obj.rid] = state
+
+        # 结束记录分词器分发阶段的 trace（标记该阶段已完成）
         trace_slice_end(
             RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
         )
+
+        # 返回请求状态对象，供后续异步等待响应使用
         return state
 
     def _send_batch_request(
