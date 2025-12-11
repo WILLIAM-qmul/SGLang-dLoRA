@@ -113,6 +113,13 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
+                        # Update model execution stats
+                        model_id = req.lora_id if req.lora_id else None
+                        self.model_exec_time[model_id][0] += 1
+                        self.model_exec_time[model_id][1] += (
+                            req.time_stats.completion_time
+                            - req.time_stats.forward_entry_time
+                        )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -380,6 +387,12 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_finished_req(req)
 
                 req.time_stats.completion_time = time.perf_counter()
+                # Update model execution stats
+                model_id = req.lora_id if req.lora_id else None
+                self.model_exec_time[model_id][0] += 1
+                self.model_exec_time[model_id][1] += (
+                    req.time_stats.completion_time - req.time_stats.forward_entry_time
+                )
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding

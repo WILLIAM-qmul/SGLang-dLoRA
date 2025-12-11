@@ -73,7 +73,7 @@ class RequestMetadata:
     request_id:  str
     model_id: Optional[str]
     engine_id: int
-    num_blocks: int
+    num_pages: int
     in_gpu: bool
     prompt_length: int = 0
     output_length: int = 0
@@ -84,7 +84,7 @@ class RequestMetadata:
             request_id=data["request_id"],
             model_id=data.get("model_id"),
             engine_id=engine_id,
-            num_blocks=data["num_blocks"],
+            num_pages=data["num_pages"],
             in_gpu=data["in_gpu"],
             prompt_length=data. get("prompt_length", 0),
             output_length=data.get("output_length", 0),
@@ -901,7 +901,7 @@ class InstanceManager:
         
         tasks = []
         for engine_id in range(self.num_instances):
-            url = f"{self.instance_urls[engine_id]}/get_engine_stats"
+            url = f"{self.instance_urls[engine_id]}/get_migration_stats"
             tasks.append(self._fetch_engine_stats(session, engine_id, url))
         
         results = await asyncio. gather(*tasks, return_exceptions=True)
@@ -919,7 +919,7 @@ class InstanceManager:
             self.reqs_metadata[engine_id] = result.req_metadata
             
             # Update model execution info
-            for model_id_str, exec_info in result. model_exec_time.items():
+            for model_id_str, exec_info in result.model_exec_time.items():
                 try:
                     model_id = int(model_id_str) if isinstance(model_id_str, str) else model_id_str
                     if 0 <= model_id < self.num_models:
@@ -936,6 +936,55 @@ class InstanceManager:
                 self.model_avg_exec_time[model_id] = self.default_exec_time
         
         logger.debug(f"Updated model avg exec times: {self.model_avg_exec_time}")
+        
+    
+    def _check_migration_needed(self) -> bool:
+        """
+        Check if migration is needed based on dLoRA's criteria: 
+        1. KV cache pressure imbalance
+        2. Request count imbalance
+        """
+        # Check KV cache pressure
+        engine_page_cnt = {}
+        for engine_id, reqs in self.reqs_metadata.items():
+            engine_page_cnt[engine_id] = sum(req.num_pages for req in reqs)
+        
+        if engine_page_cnt:
+            sorted_pages = sorted(engine_page_cnt.items(), key=lambda x: x[1])
+            most_page_engine_id, most_page_cnt = sorted_pages[-1]
+            least_page_engine_id, least_page_cnt = sorted_pages[0]
+
+            max_pages = self.num_gpu_pages[most_page_engine_id]
+            min_pages = self.num_gpu_pages[least_page_engine_id]
+
+            if max_pages > 0 and min_pages > 0:
+                if (most_page_cnt >= max_pages * 0.9 and
+                    least_page_cnt < min_pages * 0.9):
+                    logger.info(f"Migration needed: KV cache imbalance "
+                              f"(engine {most_page_engine_id}: {most_page_cnt}/{max_pages} pages, "
+                              f"engine {least_page_engine_id}:  {least_page_cnt}/{min_pages} pages)")
+                    return True
+        
+        # Check request count imbalance
+        engine_req_cnt = {i: len(reqs) for i, reqs in self.reqs_metadata.items()}
+        num_reqs = sum(engine_req_cnt.values())
+        
+        if num_reqs == 0:
+            return False
+        
+        avg_num_reqs = num_reqs / len(engine_req_cnt)
+        max_req_cnt = max(engine_req_cnt.values())
+        min_req_cnt = min(engine_req_cnt.values())
+        
+        imbalance = max_req_cnt - avg_num_reqs
+        
+        if imbalance >= self.migration_req_thres:
+            logger.info(f"Migration needed: Request imbalance "
+                      f"(max: {max_req_cnt}, avg: {avg_num_reqs:. 1f}, min: {min_req_cnt}, "
+                      f"threshold: {self.migration_req_thres})")
+            return True
+        
+        return False
 
     
     async def _perform_migration(self):
@@ -973,55 +1022,6 @@ class InstanceManager:
             
             logger.info("✓ Migration cycle complete")
             logger.info("=" * 86)
-
-    
-    def _check_migration_needed(self) -> bool:
-        """
-        Check if migration is needed based on dLoRA's criteria: 
-        1. KV cache pressure imbalance
-        2. Request count imbalance
-        """
-        # Check KV cache pressure
-        engine_block_cnt = {}
-        for engine_id, reqs in self.reqs_metadata.items():
-            engine_block_cnt[engine_id] = sum(req.num_blocks for req in reqs)
-        
-        if engine_block_cnt:
-            sorted_blocks = sorted(engine_block_cnt.items(), key=lambda x: x[1])
-            most_block_engine_id, most_block_cnt = sorted_blocks[-1]
-            least_block_engine_id, least_block_cnt = sorted_blocks[0]
-            
-            max_blocks = self.num_gpu_blocks[most_block_engine_id]
-            min_blocks = self. num_gpu_blocks[least_block_engine_id]
-            
-            if max_blocks > 0 and min_blocks > 0:
-                if (most_block_cnt >= max_blocks * 0.9 and
-                    least_block_cnt < min_blocks * 0.9):
-                    logger.info(f"Migration needed: KV cache imbalance "
-                              f"(engine {most_block_engine_id}: {most_block_cnt}/{max_blocks} blocks, "
-                              f"engine {least_block_engine_id}:  {least_block_cnt}/{min_blocks} blocks)")
-                    return True
-        
-        # Check request count imbalance
-        engine_req_cnt = {i: len(reqs) for i, reqs in self.reqs_metadata.items()}
-        num_reqs = sum(engine_req_cnt. values())
-        
-        if num_reqs == 0:
-            return False
-        
-        avg_num_reqs = num_reqs / len(engine_req_cnt)
-        max_req_cnt = max(engine_req_cnt.values())
-        min_req_cnt = min(engine_req_cnt.values())
-        
-        imbalance = max_req_cnt - avg_num_reqs
-        
-        if imbalance >= self.migration_req_thres:
-            logger.info(f"Migration needed: Request imbalance "
-                      f"(max: {max_req_cnt}, avg: {avg_num_reqs:. 1f}, min: {min_req_cnt}, "
-                      f"threshold: {self.migration_req_thres})")
-            return True
-        
-        return False
 
     
     async def _solve_migration_ilp(self):

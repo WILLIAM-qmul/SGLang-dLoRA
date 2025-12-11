@@ -64,11 +64,11 @@ _is_npu = is_npu()
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
-    EXTEND = auto()
+    EXTEND = auto() # 扩展序列（预填充），KV cache 的前半部分已算好，常用于系统提示等场景
     # Decode one token.
-    DECODE = auto()
+    DECODE = auto() # 解码一个 token，常用于生成阶段，每次只生成一个 token
     # Contains both EXTEND and DECODE when doing chunked prefill.
-    MIXED = auto()
+    MIXED = auto() # 混合模式，chunked prefill 时同时包含 EXTEND 和 DECODE
     # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
 

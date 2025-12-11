@@ -71,10 +71,8 @@ from sglang.srt.managers.io_struct import (
     GetInstanceStatsReqOutput,
     GetReqModelCntReqInput,
     GetReqModelCntReqOutput,
-    GetEngineStatsReqInput,
-    GetEngineStatsReqOutput,
-    FetchSeqGroupsReqInput,
-    FetchSeqGroupsReqOutput,
+    GetMigrationInfoReqInput,
+    GetMigrationInfoReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -410,8 +408,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Add handlers for new outputs
                 (GetInstanceStatsReqOutput, self._handle_get_instance_stats_output),
                 (GetReqModelCntReqOutput, self._handle_get_req_model_cnt_output),
-                (GetEngineStatsReqOutput, self._handle_get_engine_stats_output),
-                (FetchSeqGroupsReqOutput, self._handle_fetch_seq_groups_output),
+                (GetMigrationInfoReqOutput, self._handle_get_migration_info_output),
             ]
         )
         self.init_communicators(server_args)
@@ -1329,28 +1326,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handler for GetReqModelCntReqOutput (optional validation)"""
         if hasattr(self, "req_model_cnt_future") and self.req_model_cnt_future and not self.req_model_cnt_future.done():
             self.req_model_cnt_future.set_result(recv_obj)
+            
+    async def get_migration_info(self):
+        """
+        Get migration information from the scheduler.
+        Returns request metadata and model execution time statistics.
+        """
+        self.migration_info_future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(GetMigrationInfoReqInput())
+        return await self.migration_info_future
 
-    async def get_engine_stats(self):
-        """Send request to scheduler to get engine stats."""
-        self.engine_stats_future = asyncio.Future()
-        self.send_to_scheduler.send_pyobj(GetEngineStatsReqInput())
-        return await self.engine_stats_future
-
-    def _handle_get_engine_stats_output(self, recv_obj: GetEngineStatsReqOutput):
-        """Handle response from scheduler"""
-        if self.engine_stats_future and not self.engine_stats_future.done():
-            self.engine_stats_future.set_result(recv_obj)
-
-    async def fetch_seq_groups(self, request_ids: List[str]):
-        """Send request to scheduler to fetch sequence groups."""
-        self.fetch_seq_groups_future = asyncio.Future()
-        self.send_to_scheduler.send_pyobj(FetchSeqGroupsReqInput(request_ids=request_ids))
-        return await self.fetch_seq_groups_future
-
-    def _handle_fetch_seq_groups_output(self, recv_obj: FetchSeqGroupsReqOutput):
-        """Handle response from scheduler"""
-        if self.fetch_seq_groups_future and not self.fetch_seq_groups_future.done():
-            self.fetch_seq_groups_future.set_result(recv_obj)
+    def _handle_get_migration_info_output(self, recv_obj: GetMigrationInfoReqOutput):
+        """Process migration info response"""
+        if hasattr(self, "migration_info_future") and self.migration_info_future and not self.migration_info_future.done():
+            self.migration_info_future.set_result(recv_obj)
 
 
     def configure_logging(self, obj: ConfigureLoggingReq):

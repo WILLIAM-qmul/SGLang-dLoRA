@@ -117,10 +117,8 @@ from sglang.srt.managers.io_struct import (
     GetInstanceStatsReqOutput,
     GetReqModelCntReqInput,
     GetReqModelCntReqOutput,
-    GetEngineStatsReqInput,
-    GetEngineStatsReqOutput,
-    FetchSeqGroupsReqInput,
-    FetchSeqGroupsReqOutput,
+    GetMigrationInfoReqInput,
+    GetMigrationInfoReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -445,6 +443,8 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
+        # Add model execution time tracking: {model_id: [count, total_time]}
+        self.model_exec_time = defaultdict(lambda: [0, 0.0])
         self.default_stream: CudaStream = torch.get_device_module(
             self.device
         ).current_stream()
@@ -579,8 +579,7 @@ class Scheduler(
                 # Add new handlers
                 (GetInstanceStatsReqInput, self.get_instance_stats),
                 (GetReqModelCntReqInput, self.get_req_model_cnt),
-                (GetEngineStatsReqInput, self.get_engine_stats),
-                (FetchSeqGroupsReqInput, self.fetch_seq_groups),
+                (GetMigrationInfoReqInput, self.get_migration_info),
             ]
         )
 
@@ -992,31 +991,42 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        # 创建一个双端队列，用于存储已完成的 batch 及其结果，实现 CPU 与 GPU 计算的重叠
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
+            # 1. 非阻塞地接收来自 TokenizerManager 和 RPC 通道的请求
             recv_reqs = self.recv_requests()
+            # 2. 处理所有收到的请求（如分发、排队、异常处理等）
             self.process_input_requests(recv_reqs)
 
+            # 3. 获取下一个要运行的 batch（可能是 prefill 或 decode）
             batch = self.get_next_batch_to_run()
+            # 4. 记录当前 batch（用于后续处理）
             self.cur_batch = batch
 
             batch_result = None
             if batch:
+                # NOTE: 先用 GPU 执行推理（forward），再用 CPU 处理结果——GPU 在算下一个 batch 时，CPU 可以并行处理上一个 batch 的结果，不必等 GPU 完全空闲。
+                # 5. 如果有 batch，执行推理（GPU 计算），得到结果
                 batch_result = self.run_batch(batch)
+                # 6. 将 batch 及其结果加入结果队列，等待后续处理（CPU 处理）
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                # Process the results of the last batch
+                # 7. 如果有上一个 batch，弹出队列头部，处理其结果（如发送响应、释放资源等）
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
+                # 8. 如果当前没有 batch（系统空闲），执行自检和状态重置
                 self.self_check_during_idle()
 
+            # 9. 如果 batch_result 需要延迟采样（如 speculative decoding），则执行采样和结果处理
             self.launch_batch_sample_if_needed(batch_result)
+            # 10. 更新 last_batch 为当前 batch，供下轮循环使用
             self.last_batch = batch
 
+            # 11. 如果开启了内存泄漏检测，定期检查运行时内存泄漏
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 self._check_runtime_mem_leak()
 
@@ -1030,18 +1040,19 @@ class Scheduler(
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
+        # 主 pipeline rank（pp_rank == 0）负责从 tokenizer 和 rpc 通道接收请求
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                while True:
+                while True:            # 非阻塞地从 tokenizer 通道接收所有请求
                     try:
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
 
-                while True:
+                while True:            # 非阻塞地从 rpc 通道接收所有请求
                     try:
                         recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
@@ -1131,22 +1142,26 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        # 遍历所有收到的请求
         for recv_req in recv_reqs:
-            # If it is a health check generation request and there are running requests, ignore it.
+            # 如果是健康检查请求，并且当前有 chunked_req 或有正在运行的 batch 或有 offload_tags，则忽略该健康检查请求
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
-                self.return_health_check_ct += 1
-                continue
+                self.return_health_check_ct += 1  # 统计被忽略的健康检查请求数量
+                continue  # 跳过本次循环，不处理该请求
 
+            # 使用类型分发器处理请求，得到输出结果（output 可能是响应、异常、或其它结构）
             output = self._request_dispatcher(recv_req)
             if output is not None:
+                # 如果输出是 RPC 类型，则通过 RPC 通道发送回去
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
+                    # 否则通过 tokenizer 通道发送响应（如生成结果、异常等）
                     self.send_to_tokenizer.send_output(output, recv_req)
 
     def init_req_max_new_tokens(self, req):
@@ -1227,6 +1242,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        """
+        将用户的生成请求（如文本生成、采样等）标准化为内部的 Req 对象，并进行参数校验、预处理、异常处理，然后放入等待队列或语法队列，等待后续调度和推理。
+        """
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1395,6 +1413,7 @@ class Scheduler(
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
         else:
+            # NOTE: 放入 waiting_queue（通过 _add_request_to_queue）。
             self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
@@ -1433,14 +1452,15 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            # 普通模式（无分离），直接处理优先级和队列限制
             if not self._set_or_validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
-            self.waiting_queue.append(req)
-            req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+            self._prefetch_kvcache(req) # 预取 KV cache（如有需要）
+            self.waiting_queue.append(req) # 加入等待队列
+            req.time_stats.wait_queue_entry_time = time.perf_counter() # 记录进入队列时间
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True) # 记录请求处理结束的 trace
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1961,93 +1981,98 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.forward_ct += 1
+        self.forward_ct += 1  # 累加已执行的 batch 数量
 
         # Whether to run the profiler
-        self._profile_batch_predicate(batch)
+        self._profile_batch_predicate(batch)  # 判断是否需要对本 batch 进行性能分析
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
-            time.sleep(self.forward_sleep_time)
+            time.sleep(self.forward_sleep_time)  # 如果设置了休眠时间，则等待指定秒数
 
         # Capture prefill start time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_start_time = current_time
+                req.time_stats.prefill_start_time = current_time  # 记录 prefill 开始时间
 
         # Run forward
+        # NOTE: prefill/EXTEND：一次性处理输入 prompt，计算 KV cache。 + DECODE：自回归生成，每次生成一个 token。
         if self.is_generation:
-            batch_or_worker_batch = batch
+            batch_or_worker_batch = batch  # 默认 batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
-                # FIXME(lsyin): remove this if and finally unify the abstraction
+                # 如果启用 overlap 或没有使用推测算法，则转换为 ModelWorkerBatch
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
             if self.enable_overlap:
-                # FIXME: remove this assert
+                # TODO: implement overlap mode
+                # NOTE: in overlap mode
+                """
+                核心流程总结：
+                1. 检查 batch 类型，准备 overlap 推理。
+                2. 记录 batch，防止被回收。
+                3. 复制采样信息，保证 forward 阶段独立。
+                4. 分配 future 索引，支持异步采样。
+                5. 用 CUDA stream 执行推理，保证流同步。
+                6. 推理后，如果没有延迟采样，直接拷贝结果到 CPU；有延迟采样则保存索引，后续处理。
+                7. 记录 future 索引，供后续 batch 处理使用。
+                """
+                # overlap 模式下，必须是 ModelWorkerBatch 类型
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                self.record_batch_in_overlap(model_worker_batch)  # 记录 batch，防止 GPU tensor 被提前释放
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
-                )
+                )  # 采样信息复制一份用于本次推理
 
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
+                bs = len(model_worker_batch.seq_lens)  # 当前 batch 的序列数
+                future_indices = self.future_map.alloc_future_indices(bs)  # 分配 future 索引，用于 overlap 采样
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    self.forward_stream.wait_stream(self.default_stream)  # 等待默认 CUDA stream
+                    self.future_map.resolve_future(model_worker_batch)  # 解析 future，准备推理
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
-                    )
+                    )  # 用模型执行推理（GPU forward）
+
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
                         self.device
-                    ).Event()
+                    ).Event()  # 创建一个 CUDA Event，标记 copy 完成
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu()
+                        self.future_map.store_to_map(future_indices, batch_result)  # 存储结果到 future map
+                        batch_result.copy_to_cpu()  # 将结果从 GPU 拷贝到 CPU
                     else:
-                        batch_result.future_indices = future_indices
+                        batch_result.future_indices = future_indices  # 如果有延迟采样，保存 future 索引
 
                 # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                future_indices_or_next_token_ids = -future_indices.indices  # 记录 future 索引（负数表示特殊用途）
 
                 if batch.is_v2_eagle:
-                    # FIXME(lsyin): tmp code for eagle v2
-                    # We only keep future indices for next draft input
-
+                    # 如果是 eagle v2 draft 推测，保存下一轮输入的 future 信息
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    #     # FIXME(lsyin): remove the allocate_lens in EagleDraftInput
-                    #     allocate_lens=batch_result.next_draft_input.allocate_lens,
-                    # )
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
+                    # 当前实现严格同步 seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                # pdmux 模式下，分裂 prefill
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                # 普通推理（无 overlap/pdmux）
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
-                self.update_cache_from_scheduler(batch, batch_result)
+                self.update_cache_from_scheduler(batch, batch_result)  # 可选：更新 KV cache
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
+            batch.output_ids = future_indices_or_next_token_ids  # 保存输出 token id 或 future 索引
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2064,23 +2089,23 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            batch_result.extend_input_len_per_req = extend_input_len_per_req
+            batch_result.extend_input_len_per_req = extend_input_len_per_req  # 记录每个请求的扩展输入长度
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
-            )
-            ret = batch_result
+            )  # 记录每个请求的 logprob 起始长度
+            ret = batch_result  # 返回推理结果
         else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = EmbeddingBatchResult(embeddings=embeddings)
+            model_worker_batch = batch.get_model_worker_batch()  # 获取 embedding batch
+            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)  # 执行 embedding 推理
+            ret = EmbeddingBatchResult(embeddings=embeddings)  # 构造 embedding 结果对象
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_end_time = current_time
+                req.time_stats.prefill_end_time = current_time  # 记录 prefill 结束时间
 
-        return ret
+        return ret  # 返回最终结果
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
@@ -2533,151 +2558,162 @@ class Scheduler(
             total_requests=total_requests,
             exec_cost=exec_cost
         )
-
-    def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
-        """
-        Get engine statistics for migration decision (adapted from dLoRA). 
-        Uses actual SGLang storage structures - no simulation. 
-        """
-        # 1. Count total requests-ok
-        num_running_requests = len(self.running_batch.reqs) if self.running_batch else 0
-        num_waiting_requests = len(self.waiting_queue)
-        num_requests = num_running_requests + num_waiting_requests
         
-        # 2. Count requests per LoRA model
-        req_model_cnt = defaultdict(int)
+    def get_migration_info(self, recv_req: GetMigrationInfoReqInput):
+        """
+        Get migration information from the scheduler.
+        Returns request metadata and model execution time statistics.
+        """
         req_metadata = []
-        # active_models = set()
-        model_exec_time = defaultdict(lambda: [0, 0.0])  # [count, total_time]
         
         def process_req(req, in_gpu: bool):
-            """Process a single request to extract statistics"""
             # Use lora_id as model identifier (None = base model)
-            model_id = req.lora_id if hasattr(req, 'lora_id') and req.lora_id else None
-            req_model_cnt[model_id] += 1
+            model_id = req.lora_id if req.lora_id else None
             
-            # Track active LoRA models
-            # if model_id is not None:
-            #     active_models.add(model_id)
-            
-            # Calculate KV cache blocks for this request
-            num_blocks = 0
-            if in_gpu and hasattr(req, 'req_pool_idx'):
-                # Running requests: calculate from allocated tokens
-                num_tokens = len(req.fill_ids) if hasattr(req, 'fill_ids') else 0
-                num_blocks = (num_tokens + self.req_to_token_pool. size - 1) // self.req_to_token_pool.size
-            elif not in_gpu:
+            # Calculate KV cache blocks
+            if in_gpu:
+                # Running requests: calculate from allocated tokens (input + output generated so far)
+                num_tokens = len(req.fill_ids) if req.fill_ids else (len(req.origin_input_ids) + len(req.output_ids))
+            else:
                 # Waiting requests: estimate from prompt length
-                prompt_len = len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0
-                estimated_tokens = prompt_len + (req.sampling_params.max_new_tokens if hasattr(req, 'sampling_params') else 0)
-                num_blocks = (estimated_tokens + self.req_to_token_pool.size - 1) // self.req_to_token_pool.size
+                num_tokens = len(req.origin_input_ids)
             
-            # Only include waiting requests in metadata (for migration consideration)
-            if not in_gpu:
-                req_metadata.append({
-                    "request_id": req.rid,
-                    "model_id": model_id,
-                    "num_blocks": num_blocks,
-                    "in_gpu": in_gpu,
-                    "prompt_length": len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0,
-                    "output_length": req.sampling_params. max_new_tokens if hasattr(req, 'sampling_params') else 0,
-                })
+            num_pages = 0
+            if self.page_size > 0:
+                num_blocks = (num_tokens + self.page_size - 1) // self.page_size
             
-            # Track execution time for running requests
-            if in_gpu and hasattr(req, 'created_time'):
-                exec_time = time.time() - req.created_time
-                model_exec_time[model_id][0] += 1
-                model_exec_time[model_id][1] += exec_time
-        
-        # Process running requests
+            req_metadata.append({
+                "request_id": req.rid,
+                "model_id": model_id,
+                "num_pages": num_pages,
+                "in_gpu": in_gpu,
+                "prompt_length": len(req.origin_input_ids),
+                "output_length": len(req.output_ids) if in_gpu else req.sampling_params.max_new_tokens,
+            })
+
+        # 1. Collect metadata from waiting queue
+        for req in self.waiting_queue:
+            process_req(req, in_gpu=False)
+            
+        # 2. Collect metadata from running batch
         if self.running_batch:
             for req in self.running_batch.reqs:
                 process_req(req, in_gpu=True)
-        
-        # Process waiting requests
-        for req in self.waiting_queue:
-            process_req(req, in_gpu=False)
-
-        # 3. Calculate free GPU pages (actual, not estimated)-ok
-        num_free_gpu_pages = self.token_to_kv_pool_allocator.available_size() // self.page_size
-        
-        # 4. Get available GPU memory (in bytes)-ok
-        available_gpu_memory = get_available_gpu_memory(
-            self.device, 
-            self.gpu_id, 
-            empty_cache=False
-        ) * (1 << 30)  # Convert GB to bytes
-
-        # 5. Calculate cache page size (in bytes)-ok
-        '''method 1: based on k/v buffer shapes'''
-        # kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        # k_page_size = kv_cache.k_buffer[0][0].nbytes * kv_cache.page_size
-        # v_page_size = kv_cache.v_buffer[0][0].nbytes * kv_cache.page_size
-        # cache_page_size = (k_page_size + v_page_size) * kv_cache.layer_num
-        '''method 2: based on total kv size and total tokens'''
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        page_size = self.token_to_kv_pool_allocator.page_size
-        total_kv_bytes_tuple = kv_cache.get_kv_size_bytes()  # 返回 (k_bytes, v_bytes)
-        total_kv_bytes = sum(total_kv_bytes_tuple)           # 修复：取总和
-        total_tokens = kv_cache.size
-        bytes_per_token = total_kv_bytes / total_tokens if total_tokens > 0 else 0
-        cache_page_size = int(bytes_per_token * page_size)
-        
-        # 6. Get LoRA capacity-ok
-        lora_capacity = self.max_loras_per_batch if self.enable_lora else 0
-
-        # 7.  Construct response-ok
-        res = GetEngineStatsReqOutput(
-            num_requests=num_requests,
-            req_model_cnt=dict(req_model_cnt),
-            num_free_gpu_pages=num_free_gpu_pages,
+                
+        # 3. Return aggregated info
+        return GetMigrationInfoReqOutput(
             req_metadata=req_metadata,
-            lora_capacity=lora_capacity,
-            available_gpu_memory=available_gpu_memory,
-            cache_page_size=cache_page_size,
-            model_exec_time=dict(model_exec_time),
-            # active_models=list(active_models),
+            model_exec_time=dict(self.model_exec_time),
+            num_requests=len(req_metadata)
         )
+
+    # NOTE: example code for get_engine_stats (not used currently)
+    # def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
+    #     """
+    #     Get engine statistics for migration decision (adapted from dLoRA). 
+    #     Uses actual SGLang storage structures - no simulation. 
+    #     """
+    #     # 1. Count total requests-ok
+    #     num_running_requests = len(self.running_batch.reqs) if self.running_batch else 0
+    #     num_waiting_requests = len(self.waiting_queue)
+    #     num_requests = num_running_requests + num_waiting_requests
         
-        return res
-    
-    def fetch_seq_groups(self, recv_req: FetchSeqGroupsReqInput):
-        """
-        Fetch sequence groups for migration.
-        Adapted from dLoRA's fetch method.
-        """
-        request_ids = set(recv_req.request_ids)
-        seq_groups = []
+    #     # 2. Count requests per LoRA model
+    #     req_model_cnt = defaultdict(int)
+    #     req_metadata = []
+    #     # active_models = set()
+    #     model_exec_time = defaultdict(lambda: [0, 0.0])  # [count, total_time]
         
-        # Search in waiting queue
-        for req in self.waiting_queue:
-            if req.rid in request_ids:
-                seq_group = {
-                    "request_id": req.rid,
-                    "prompt": req.text if hasattr(req, 'text') else "",
-                    "prompt_token_ids": req.origin_input_ids. tolist(),
-                    "sampling_params": req.sampling_params. to_dict(),
-                    "lora_path": req.lora_path,
-                    "num_blocks": len(req.prefix_indices) if hasattr(req, 'prefix_indices') else 0,
-                }
-                seq_groups.append(seq_group)
+    #     def process_req(req, in_gpu: bool):
+    #         """Process a single request to extract statistics"""
+    #         # Use lora_id as model identifier (None = base model)
+    #         model_id = req.lora_id if hasattr(req, 'lora_id') and req.lora_id else None
+    #         req_model_cnt[model_id] += 1
+            
+    #         # Track active LoRA models
+    #         # if model_id is not None:
+    #         #     active_models.add(model_id)
+            
+    #         # Calculate KV cache blocks for this request
+    #         num_blocks = 0
+    #         if in_gpu and hasattr(req, 'req_pool_idx'):
+    #             # Running requests: calculate from allocated tokens
+    #             num_tokens = len(req.fill_ids) if hasattr(req, 'fill_ids') else 0
+    #             num_blocks = (num_tokens + self.req_to_token_pool. size - 1) // self.req_to_token_pool.size
+    #         elif not in_gpu:
+    #             # Waiting requests: estimate from prompt length
+    #             prompt_len = len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0
+    #             estimated_tokens = prompt_len + (req.sampling_params.max_new_tokens if hasattr(req, 'sampling_params') else 0)
+    #             num_blocks = (estimated_tokens + self.req_to_token_pool.size - 1) // self.req_to_token_pool.size
+            
+    #         # Only include waiting requests in metadata (for migration consideration)
+    #         if not in_gpu:
+    #             req_metadata.append({
+    #                 "request_id": req.rid,
+    #                 "model_id": model_id,
+    #                 "num_blocks": num_blocks,
+    #                 "in_gpu": in_gpu,
+    #                 "prompt_length": len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0,
+    #                 "output_length": req.sampling_params. max_new_tokens if hasattr(req, 'sampling_params') else 0,
+    #             })
+            
+    #         # Track execution time for running requests
+    #         if in_gpu and hasattr(req, 'created_time'):
+    #             exec_time = time.time() - req.created_time
+    #             model_exec_time[model_id][0] += 1
+    #             model_exec_time[model_id][1] += exec_time
         
-        # Search in running batch
-        if self.running_batch:
-            for req in self.running_batch.reqs:
-                if req.rid in request_ids:
-                    seq_group = {
-                        "request_id": req.rid,
-                        "prompt": req.text if hasattr(req, 'text') else "",
-                        "prompt_token_ids": req.origin_input_ids.tolist(),
-                        "sampling_params": req.sampling_params.to_dict(),
-                        "lora_path": req.lora_path,
-                        "num_blocks": len(req.prefix_indices) if hasattr(req, 'prefix_indices') else 0,
-                        "output_ids": req.output_ids,
-                    }
-                    seq_groups.append(seq_group)
+    #     # Process running requests
+    #     if self.running_batch:
+    #         for req in self.running_batch.reqs:
+    #             process_req(req, in_gpu=True)
         
-        return FetchSeqGroupsReqOutput(seq_groups=seq_groups)
+    #     # Process waiting requests
+    #     for req in self.waiting_queue:
+    #         process_req(req, in_gpu=False)
+
+    #     # 3. Calculate free GPU pages (actual, not estimated)-ok
+    #     num_free_gpu_pages = self.token_to_kv_pool_allocator.available_size() // self.page_size
+        
+    #     # 4. Get available GPU memory (in bytes)-ok
+    #     available_gpu_memory = get_available_gpu_memory(
+    #         self.device, 
+    #         self.gpu_id, 
+    #         empty_cache=False
+    #     ) * (1 << 30)  # Convert GB to bytes
+
+    #     # 5. Calculate cache page size (in bytes)-ok
+    #     '''method 1: based on k/v buffer shapes'''
+    #     # kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+    #     # k_page_size = kv_cache.k_buffer[0][0].nbytes * kv_cache.page_size
+    #     # v_page_size = kv_cache.v_buffer[0][0].nbytes * kv_cache.page_size
+    #     # cache_page_size = (k_page_size + v_page_size) * kv_cache.layer_num
+    #     '''method 2: based on total kv size and total tokens'''
+    #     kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+    #     page_size = self.token_to_kv_pool_allocator.page_size
+    #     total_kv_bytes_tuple = kv_cache.get_kv_size_bytes()  # 返回 (k_bytes, v_bytes)
+    #     total_kv_bytes = sum(total_kv_bytes_tuple)           # 修复：取总和
+    #     total_tokens = kv_cache.size
+    #     bytes_per_token = total_kv_bytes / total_tokens if total_tokens > 0 else 0
+    #     cache_page_size = int(bytes_per_token * page_size)
+        
+    #     # 6. Get LoRA capacity-ok
+    #     lora_capacity = self.max_loras_per_batch if self.enable_lora else 0
+
+    #     # 7.  Construct response-ok
+    #     res = GetEngineStatsReqOutput(
+    #         num_requests=num_requests,
+    #         req_model_cnt=dict(req_model_cnt),
+    #         num_free_gpu_pages=num_free_gpu_pages,
+    #         req_metadata=req_metadata,
+    #         lora_capacity=lora_capacity,
+    #         available_gpu_memory=available_gpu_memory,
+    #         cache_page_size=cache_page_size,
+    #         model_exec_time=dict(model_exec_time),
+    #         # active_models=list(active_models),
+    #     )
+        
+    #     return res
     
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
@@ -3075,6 +3111,8 @@ def run_scheduler_process(
             elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
+                # TODO: scheduler event loop with overlap
+                # NOTE: 运行这个分支
                 scheduler.event_loop_overlap()
             else:
                 scheduler.event_loop_normal()

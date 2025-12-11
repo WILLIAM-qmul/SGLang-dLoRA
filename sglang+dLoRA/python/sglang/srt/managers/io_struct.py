@@ -1578,8 +1578,47 @@ class GetReqModelCntReqOutput(BaseReq):
     req_model_cnt: Dict[str, int]
     total_requests: int = 0
     exec_cost: float = 0.0
+    
 
-# ...existing code...
+@dataclass
+class RequestMetadata: 
+    """单个请求的元数据，用于迁移决策"""
+    request_id: str
+    model_id: Optional[str]
+    engine_id: int
+    num_pages: int
+    in_gpu: bool
+    prompt_length: int = 0
+    output_length: int = 0
+    
+    @classmethod
+    def from_req(cls, req, engine_id:  int, num_blocks: int, in_gpu: bool) -> "RequestMetadata":
+        """从 Req 对象构造元数据"""
+        return cls(
+            request_id=req.rid,
+            model_id=req.lora_path if hasattr(req, 'lora_path') else None,
+            engine_id=engine_id,
+            num_blocks=num_blocks,
+            in_gpu=in_gpu,
+            prompt_length=len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0,
+            output_length=len(req.output_ids) if hasattr(req, 'output_ids') else 0
+        )
+
+@dataclass
+class GetMigrationInfoReqInput(BaseReq):
+    """Request to get migration information from scheduler"""
+    pass
+
+
+@dataclass
+class GetMigrationInfoReqOutput(BaseReq):
+    """Response containing migration information"""
+    # List of request metadata for all active requests
+    req_metadata: List[Dict[str, Any]]
+    # Model execution time:  {model_id: [count, total_time]}
+    model_exec_time: Dict[str, Tuple[int, float]]
+    # Total number of requests
+    num_requests: int = 0
 
 
 def _check_all_req_types():
