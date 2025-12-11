@@ -1557,6 +1557,17 @@ class LazyDumpTensorsReqOutput(BaseReq):
 # --- New additions for EngineManager integration ---
 
 @dataclass
+class GetInstanceStatsReqInput(BaseReq):
+    pass
+
+@dataclass
+class GetInstanceStatsReqOutput(BaseReq):
+    lora_capacity: int
+    available_gpu_memory: float
+    num_free_gpu_pages: int
+    cache_page_size: int
+
+@dataclass
 class GetEngineStatsReqInput(BaseReq):
     pass
 
@@ -1567,11 +1578,10 @@ class GetEngineStatsReqOutput(BaseReq):
     num_free_gpu_pages: int
     req_metadata: List[Dict]
     lora_capacity: int
-    active_models: List[str]
     available_gpu_memory: float
     cache_page_size: int
-    lora_weight_size: int
     model_exec_time: Dict[int, Tuple[int, float]] = field(default_factory=dict)
+    # active_models: List[str]
 
 @dataclass
 class FetchSeqGroupsReqInput(BaseReq):

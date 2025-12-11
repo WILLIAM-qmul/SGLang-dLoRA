@@ -113,6 +113,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     # Add new imports
+    GetInstanceStatsReqInput,
+    GetInstanceStatsReqOutput,
     GetEngineStatsReqInput,
     GetEngineStatsReqOutput,
     FetchSeqGroupsReqInput,
@@ -573,6 +575,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 # Add new handlers
+                (GetInstanceStatsReqInput, self.get_instance_stats),
                 (GetEngineStatsReqInput, self.get_engine_stats),
                 (FetchSeqGroupsReqInput, self.fetch_seq_groups),
             ]
@@ -2441,6 +2444,50 @@ class Scheduler(
         
     
     # Add to Scheduler class in sglang/srt/managers/scheduler.py
+    
+    def get_instance_stats(self, recv_req: GetInstanceStatsReqInput):
+        """
+        Get instance statistics for migration decision (adapted from dLoRA). 
+        Uses actual SGLang storage structures - no simulation. 
+        """
+        # 1. Get LoRA capacity-ok
+        lora_capacity = self.max_loras_per_batch if self.enable_lora else 0
+        
+        # 2. Calculate free GPU pages (actual, not estimated)-ok
+        num_free_gpu_pages = self.token_to_kv_pool_allocator.available_size() // self.page_size
+        
+        # 3. Get available GPU memory (in bytes)-ok
+        available_gpu_memory = get_available_gpu_memory(
+            self.device, 
+            self.gpu_id, 
+            empty_cache=False
+        ) * (1 << 30)  # Convert GB to bytes
+
+        # 4. Calculate cache page size (in bytes)-ok
+        '''method 1: based on k/v buffer shapes'''
+        # kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        # k_page_size = kv_cache.k_buffer[0][0].nbytes * kv_cache.page_size
+        # v_page_size = kv_cache.v_buffer[0][0].nbytes * kv_cache.page_size
+        # cache_page_size = (k_page_size + v_page_size) * kv_cache.layer_num
+        '''method 2: based on total kv size and total tokens'''
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = self.token_to_kv_pool_allocator.page_size
+        total_kv_bytes_tuple = kv_cache.get_kv_size_bytes()  # 返回 (k_bytes, v_bytes)
+        total_kv_bytes = sum(total_kv_bytes_tuple)           # 修复：取总和
+        total_tokens = kv_cache.size
+        bytes_per_token = total_kv_bytes / total_tokens if total_tokens > 0 else 0
+        cache_page_size = int(bytes_per_token * page_size)
+        
+
+        # 5. Construct response-ok
+        res = GetInstanceStatsReqOutput(
+            lora_capacity=lora_capacity,
+            num_free_gpu_pages=num_free_gpu_pages,
+            available_gpu_memory=available_gpu_memory,
+            cache_page_size=cache_page_size,
+        )
+        
+        return res
 
     def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
         """
@@ -2455,7 +2502,7 @@ class Scheduler(
         # 2. Count requests per LoRA model
         req_model_cnt = defaultdict(int)
         req_metadata = []
-        active_models = set()
+        # active_models = set()
         model_exec_time = defaultdict(lambda: [0, 0.0])  # [count, total_time]
         
         def process_req(req, in_gpu: bool):
@@ -2465,8 +2512,8 @@ class Scheduler(
             req_model_cnt[model_id] += 1
             
             # Track active LoRA models
-            if model_id is not None:
-                active_models.add(model_id)
+            # if model_id is not None:
+            #     active_models.add(model_id)
             
             # Calculate KV cache blocks for this request
             num_blocks = 0
@@ -2531,40 +2578,20 @@ class Scheduler(
         bytes_per_token = total_kv_bytes / total_tokens if total_tokens > 0 else 0
         cache_page_size = int(bytes_per_token * page_size)
         
-        # 6. Calculate actual LoRA weight size (if LoRA is enabled)
-        lora_weight_size = 0
-        if self.enable_lora and hasattr(self. tp_worker, 'model_runner'):
-            lora_manager = self.tp_worker.model_runner.lora_manager
-            if lora_manager and hasattr(lora_manager, 'lora_memory_pool'):
-                lora_pool = lora_manager.lora_memory_pool
-                dtype_size = torch.tensor([], dtype=lora_manager.dtype).element_size()
-                
-                total_lora_size = 0
-                for module_name in lora_pool. target_modules:
-                    for layer_id in range(lora_pool.num_layer):
-                        A_shape = lora_pool.A_buffer[module_name][layer_id].shape
-                        total_lora_size += A_shape[0] * A_shape[1] * A_shape[2] * dtype_size
-                        
-                        B_shape = lora_pool. B_buffer[module_name][layer_id].shape
-                        total_lora_size += B_shape[0] * B_shape[1] * B_shape[2] * dtype_size
-                
-                lora_weight_size = total_lora_size // lora_pool.max_loras_per_batch
-        
-        # 7. Get LoRA capacity-ok
+        # 6. Get LoRA capacity-ok
         lora_capacity = self.max_loras_per_batch if self.enable_lora else 0
-        
-        # 8.  Construct response-ok
+
+        # 7.  Construct response-ok
         res = GetEngineStatsReqOutput(
             num_requests=num_requests,
             req_model_cnt=dict(req_model_cnt),
             num_free_gpu_pages=num_free_gpu_pages,
             req_metadata=req_metadata,
             lora_capacity=lora_capacity,
-            active_models=list(active_models),
             available_gpu_memory=available_gpu_memory,
             cache_page_size=cache_page_size,
-            lora_weight_size=lora_weight_size,
             model_exec_time=dict(model_exec_time),
+            # active_models=list(active_models),
         )
         
         return res

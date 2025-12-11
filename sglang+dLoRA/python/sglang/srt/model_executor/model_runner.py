@@ -792,6 +792,7 @@ class ModelRunner:
             )
 
         self.dtype = self.model_config.dtype
+        logger.info(f"Model config dtype: {self.model_config.dtype}")
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory

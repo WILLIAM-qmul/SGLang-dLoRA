@@ -322,21 +322,23 @@ app.add_middleware(
 
 # ... existing imports ... 
 from sglang.srt. entrypoints.http_server_extensions import (
+    get_instance_stats,
     get_engine_stats,
+    get_loaded_lora_adapters,
     fetch_seq_groups,
     insert_seq_groups,
     abort_requests,
-    adjust_lora_adapter,
 )
 
 # ... existing code ... 
 
 # Add these routes after existing route definitions
+app.add_api_route("/get_instance_stats", get_instance_stats, methods=["GET"])
 app.add_api_route("/get_engine_stats", get_engine_stats, methods=["GET"])
+app.add_api_route("/get_loaded_lora_adapters", get_loaded_lora_adapters, methods=["GET"])
 app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
 app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])
 app.add_api_route("/abort_requests", abort_requests, methods=["POST"])
-app.add_api_route("/adjust_lora_adapter", adjust_lora_adapter, methods=["POST"])
 
 
 @app.exception_handler(HTTPException)

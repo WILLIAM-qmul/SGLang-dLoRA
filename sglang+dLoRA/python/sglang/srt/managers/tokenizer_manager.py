@@ -67,6 +67,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
     # Add new imports
+    GetInstanceStatsReqInput,
+    GetInstanceStatsReqOutput,
     GetEngineStatsReqInput,
     GetEngineStatsReqOutput,
     FetchSeqGroupsReqInput,
@@ -404,6 +406,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 # Add handlers for new outputs
+                (GetInstanceStatsReqOutput, self._handle_get_instance_stats_output),
                 (GetEngineStatsReqOutput, self._handle_get_engine_stats_output),
                 (FetchSeqGroupsReqOutput, self._handle_fetch_seq_groups_output),
             ]
@@ -411,6 +414,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.init_communicators(server_args)
         
         # Futures for async requests
+        self.instance_stats_future = None
         self.engine_stats_future = None
         self.fetch_seq_groups_future = None
 
@@ -1257,6 +1261,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         
     
     # Add to TokenizerManager class in sglang/srt/managers/tokenizer_manager.py
+
+    async def get_instance_stats(self):
+        """Send request to scheduler to get instance stats."""
+        self.instance_stats_future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(GetInstanceStatsReqInput())
+        return await self.instance_stats_future
+    
+    def _handle_get_instance_stats_output(self, recv_obj: GetInstanceStatsReqOutput):
+        """Handle response from scheduler"""
+        if self.instance_stats_future and not self.instance_stats_future.done():
+            self.instance_stats_future.set_result(recv_obj)
 
     async def get_engine_stats(self):
         """Send request to scheduler to get engine stats."""
