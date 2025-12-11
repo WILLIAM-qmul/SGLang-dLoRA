@@ -1566,6 +1566,18 @@ class GetInstanceStatsReqOutput(BaseReq):
     available_gpu_memory: float
     num_free_gpu_pages: int
     cache_page_size: int
+    
+@dataclass
+class GetReqModelCntReqInput(BaseReq):
+    """Request input for getting request model count statistics"""
+    pass
+
+@dataclass
+class GetReqModelCntReqOutput(BaseReq):
+    """Response output containing request model count statistics"""
+    req_model_cnt: Dict[str, int]
+    total_requests: int = 0
+    exec_cost: float = 0.0
 
 @dataclass
 class GetEngineStatsReqInput(BaseReq):

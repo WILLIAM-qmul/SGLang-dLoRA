@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     # Add new imports
     GetInstanceStatsReqInput,
     GetInstanceStatsReqOutput,
+    GetReqModelCntReqInput,
+    GetReqModelCntReqOutput,
     GetEngineStatsReqInput,
     GetEngineStatsReqOutput,
     FetchSeqGroupsReqInput,
@@ -407,6 +409,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (HealthCheckOutput, lambda x: None),
                 # Add handlers for new outputs
                 (GetInstanceStatsReqOutput, self._handle_get_instance_stats_output),
+                (GetReqModelCntReqOutput, self._handle_get_req_model_cnt_output),
                 (GetEngineStatsReqOutput, self._handle_get_engine_stats_output),
                 (FetchSeqGroupsReqOutput, self._handle_fetch_seq_groups_output),
             ]
@@ -1272,6 +1275,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle response from scheduler"""
         if self.instance_stats_future and not self.instance_stats_future.done():
             self.instance_stats_future.set_result(recv_obj)
+            
+    async def get_req_model_cnt(self):
+        """
+        Get request model count statistics from scheduler.
+        Lightweight alternative to get_engine_stats.
+        """
+        self.req_model_cnt_future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(GetReqModelCntReqInput())
+        return await self.req_model_cnt_future
+
+    def _handle_get_req_model_cnt_output(self, recv_obj: GetReqModelCntReqOutput):
+        """Handler for GetReqModelCntReqOutput (optional validation)"""
+        if hasattr(self, "req_model_cnt_future") and self.req_model_cnt_future and not self.req_model_cnt_future.done():
+            self.req_model_cnt_future.set_result(recv_obj)
 
     async def get_engine_stats(self):
         """Send request to scheduler to get engine stats."""

@@ -115,6 +115,8 @@ from sglang.srt.managers.io_struct import (
     # Add new imports
     GetInstanceStatsReqInput,
     GetInstanceStatsReqOutput,
+    GetReqModelCntReqInput,
+    GetReqModelCntReqOutput,
     GetEngineStatsReqInput,
     GetEngineStatsReqOutput,
     FetchSeqGroupsReqInput,
@@ -576,6 +578,7 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 # Add new handlers
                 (GetInstanceStatsReqInput, self.get_instance_stats),
+                (GetReqModelCntReqInput, self.get_req_model_cnt),
                 (GetEngineStatsReqInput, self.get_engine_stats),
                 (FetchSeqGroupsReqInput, self.fetch_seq_groups),
             ]
@@ -2488,6 +2491,48 @@ class Scheduler(
         )
         
         return res
+    
+    def get_req_model_cnt(self, recv_req:  GetReqModelCntReqInput = None):
+        """
+        Get lightweight request model count statistics. 
+        Similar to dLoRA-artifact's get_req_model_cnt. 
+        """
+        # Collect model counts from all active requests
+        req_model_cnt = {}
+        
+        # Count from waiting queue
+        for req in self.waiting_queue:
+            if hasattr(req, 'lora_id') and req.lora_id:
+                model_id = req.lora_id  # Use lora_id as model identifier
+                req_model_cnt[model_id] = req_model_cnt.get(model_id, 0) + 1
+        
+        # Count from running batch
+        if self.running_batch:
+            for req in self.running_batch.reqs:
+                if hasattr(req, 'lora_id') and req.lora_id:
+                    model_id = req.lora_id
+                    req_model_cnt[model_id] = req_model_cnt.get(model_id, 0) + 1
+        
+        # Calculate execution cost (similar to dLoRA-artifact)
+        exec_cost = 0.0
+        merge_speed_ratio = 0.6  # From dLoRA-artifact default
+        max_batch_size = self.max_running_requests
+        
+        res_cnt = 0
+        for model_id, cnt in req_model_cnt.items():
+            res_cnt += cnt % max_batch_size
+            exec_cost += (cnt // max_batch_size) * merge_speed_ratio
+        
+        if res_cnt > 0:
+            exec_cost += (res_cnt / max_batch_size) * merge_speed_ratio
+        
+        total_requests = sum(req_model_cnt.values())
+        
+        return GetReqModelCntReqOutput(
+            req_model_cnt=req_model_cnt,
+            total_requests=total_requests,
+            exec_cost=exec_cost
+        )
 
     def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
         """

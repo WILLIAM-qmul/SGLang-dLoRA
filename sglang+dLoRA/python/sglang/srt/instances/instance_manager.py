@@ -46,6 +46,25 @@ class InstanceStats: # ✅
             num_free_gpu_pages=data["num_free_gpu_pages"],
             cache_page_size=data["cache_page_size"],
         )
+        
+
+@dataclass
+class ReqModelCntStats: # ✅
+    """Lightweight statistics for request model count only"""
+    engine_id: int
+    req_model_cnt: Dict[str, int]  # model_id -> request count
+    exec_cost: float = 0.0
+    engine_num_requests: int = 0
+    
+    @classmethod
+    def from_response(cls, data: Dict, engine_id: int) -> "ReqModelCntStats": 
+        """Parse response from scheduler"""
+        return cls(
+            engine_id=engine_id,
+            req_model_cnt=data.get("req_model_cnt", {}),
+            exec_cost=data.get("exec_cost", 0.0),
+            engine_num_requests=data.get("total_requests", 0)
+        )
 
 
 @dataclass
@@ -204,6 +223,9 @@ class InstanceManager:
         # Engine capacity
         self.engine_lora_capacity: List[int] = [lora_capacity_per_engine] * num_instances
         
+        # New: Track number of requests per engine
+        self.engine_num_requests: Dict[int, int] = {i: 0 for i in range(num_instances)}
+        
         logger.info(f"InstanceManager initialized: {num_instances} instances, {num_models} models")
 
     
@@ -352,7 +374,7 @@ class InstanceManager:
         logger.info(f"LoRA placement:  {num_lora_replicas} replicas, mapping={self.engine_model_mapping}")
 
     
-    def find_best_lora_weight_schedule(  # ✅
+    def find_best_lora_weight_schedule( # ✅
         self,
         expected_lora_distribution: List[float],
         current_lora_distribution: List[int] = None,
@@ -468,12 +490,12 @@ class InstanceManager:
         logger.info(f"LoRA placement applied to {success_count}/{self.num_instances} instances")
 
     
-    async def _sync_lora_adapters(
+    async def _sync_lora_adapters( # ✅
         self,
         session: aiohttp.ClientSession,
         engine_id: int,
         target_model_ids: List[int]
-    ) -> Dict: # ✅
+    ) -> Dict:
         """
         Synchronize LoRA adapters on a single engine to match target_model_ids.
         Uses SGLang's official /load_lora_adapter and /unload_lora_adapter endpoints.
@@ -562,11 +584,11 @@ class InstanceManager:
         return results
 
     
-    async def _get_loaded_adapters(
+    async def _get_loaded_adapters( # ✅
         self,
         session: aiohttp.ClientSession,
         base_url: str
-    ) -> Dict[str, str]: # ✅
+    ) -> Dict[str, str]:
         """
         Get currently loaded LoRA adapters from an instance using the dedicated endpoint.
         
@@ -587,13 +609,13 @@ class InstanceManager:
             return {}
 
     
-    async def _load_lora_adapter(
+    async def _load_lora_adapter( # ✅
         self,
         session: aiohttp.ClientSession,
         base_url: str,
         lora_name: str,
         lora_path: str
-    ) -> Optional[Dict[str, str]]: # ✅
+    ) -> Optional[Dict[str, str]]:
         """
         Load a LoRA adapter using SGLang's official /load_lora_adapter endpoint. 
         
@@ -636,12 +658,12 @@ class InstanceManager:
             return None
 
     
-    async def _unload_lora_adapter(
+    async def _unload_lora_adapter( # ✅
         self,
         session: aiohttp.ClientSession,
         base_url: str,
         lora_name: str
-    ) -> bool:  # ✅
+    ) -> bool:
         """
         Unload a LoRA adapter using SGLang's official /unload_lora_adapter endpoint. 
         
@@ -688,9 +710,59 @@ class InstanceManager:
             timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=300)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
+    
+    
+    async def _update_engine_costs(self): # ✅
+        """
+        Update engine execution costs based on current request distribution.
+        Uses lightweight req_model_cnt endpoint instead of full engine stats.
+        """
+        session = await self._get_session()
+        
+        tasks = []
+        for instance_url in self.instance_urls:
+            url = f"{instance_url}/get_req_model_cnt"
+            tasks.append(session.get(url, timeout=aiohttp.ClientTimeout(total=5)))
+        
+        try:
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for i, response in enumerate(responses):
+                try:
+                    data = await response.json()
+                    
+                    # Store the statistics
+                    self.engine_req_model_cnt[i] = data.get("req_model_cnt", {})
+                    self.engine_num_requests[i] = data.get("total_requests", 0)
+                    self.engine_exec_cost[i] = data.get("exec_cost", 0.0)
+                    
+                    logger.debug(
+                        f"Engine {i}:  {self.engine_num_requests[i]} requests, "
+                        f"cost={self.engine_exec_cost[i]:.2f}, "
+                        f"models={list(self.engine_req_model_cnt[i].keys())}"
+                    )
+                
+                except Exception as e:
+                    logger.error(f"Failed to parse req_model_cnt from instance {i}: {e}")
+                    self.engine_exec_cost[i] = 0.0
+                    self.engine_req_model_cnt[i] = {}
+                    self.engine_num_requests[i] = 0
+        
+        except Exception as e:
+            logger. error(f"Error updating engine costs: {e}")
+            
+    
+    async def _apply_lora_placement_single(self, engine_id: int): # ✅
+        """Apply LoRA placement to a single instance"""
+        session = await self._get_session()
+        active_model_ids = self.engine_model_mapping[engine_id]
+        result = await self._sync_lora_adapters(session, engine_id, active_model_ids)
+        
+        if not result.get("success", False):
+            logger.error(f"Failed to apply LoRA placement to engine {engine_id}: {result. get('errors', [])}")
 
     
-    async def select_engine(self, request_id: str, model_id: int) -> int:
+    async def select_engine(self, request_id: str, model_id: int) -> int: # ✅
         """
         Select engine for a new request using dLoRA's dispatch logic.
         
@@ -771,47 +843,39 @@ class InstanceManager:
             return min_engine_id
 
     
-    async def _apply_lora_placement_single(self, engine_id: int):
-        """Apply LoRA placement to a single instance"""
-        session = await self._get_session()
-        active_model_ids = self.engine_model_mapping[engine_id]
-        result = await self._sync_lora_adapters(session, engine_id, active_model_ids)
-        
-        if not result.get("success", False):
-            logger.error(f"Failed to apply LoRA placement to engine {engine_id}: {result. get('errors', [])}")
+    def is_running(self) -> bool: # ✅
+        """Check if background migration loop is running"""
+        return self._running
 
     
-    async def _update_engine_costs(self):
-        """Update execution costs for all engines using dLoRA's formula"""
-        session = await self._get_session()
-        tasks = []
+    async def start_background_loop(self): # ✅
+        """Start periodic migration loop"""
+        if self._running:
+            logger.warning("Background loop already running")
+            return
         
-        for engine_id in range(self.num_instances):
-            url = f"{self.instance_urls[engine_id]}/get_engine_stats"
-            tasks.append(self._fetch_engine_stats(session, engine_id, url))
+        if self.migration_type == MigrationType.DISPATCH_ONLY:
+            logger.info("Migration type is DISPATCH_ONLY, background loop not started")
+            return
         
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for engine_id, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger. debug(f"Failed to fetch stats from engine {engine_id}: {result}")
-                continue
-            
-            self.engine_stats[engine_id] = result
-            req_model_cnt = result.req_model_cnt
-            
-            # Calculate execution cost (dLoRA formula)
-            cost = 0.0
-            res_cnt = 0
-            for _, cnt in req_model_cnt.items():
-                res_cnt += cnt % self.max_running_requests
-                cost += (cnt // self.max_running_requests) * self.merge_speed_ratio
-            cost += res_cnt // self.max_running_requests
-            
-            self.engine_exec_cost[engine_id] = cost
-            self.engine_req_model_cnt[engine_id] = req_model_cnt
+        self._running = True
+        self. background_loop = asyncio.create_task(self. run_loop())
+        logger.info(f"Background migration loop started (interval: {self. migration_interval}s)")
 
     
+    async def run_loop(self): # ✅
+        """Main periodic migration loop"""
+        logger.info("Migration loop running...")
+        
+        while self._running:
+            await asyncio.sleep(self.migration_interval)
+            
+            try:
+                await self._perform_migration()
+            except Exception as e:
+                logger.error(f"Migration cycle failed: {e}", exc_info=True)
+                
+                
     async def _fetch_engine_stats(
         self,
         session: aiohttp.ClientSession,
@@ -829,78 +893,8 @@ class InstanceManager:
         except Exception as e:
             logger.debug(f"Error fetching engine stats from {engine_id}: {e}")
             return None
-
-    
-    def is_running(self) -> bool:
-        """Check if background migration loop is running"""
-        return self._running
-
-    
-    async def start_background_loop(self):
-        """Start periodic migration loop"""
-        if self._running:
-            logger.warning("Background loop already running")
-            return
         
-        if self.migration_type == MigrationType.DISPATCH_ONLY:
-            logger.info("Migration type is DISPATCH_ONLY, background loop not started")
-            return
         
-        self._running = True
-        self. background_loop = asyncio.create_task(self. run_loop())
-        logger.info(f"Background migration loop started (interval: {self. migration_interval}s)")
-
-    
-    async def run_loop(self):
-        """Main periodic migration loop"""
-        logger.info("Migration loop running...")
-        
-        while self._running:
-            await asyncio.sleep(self.migration_interval)
-            
-            try:
-                await self._perform_migration()
-            except Exception as e:
-                logger.error(f"Migration cycle failed: {e}", exc_info=True)
-
-    
-    async def _perform_migration(self):
-        """
-        Perform migration decision and execution.
-        Based on dLoRA's migration_schedule logic.
-        """
-        async with self.migration_lock:
-            logger.info("=" * 86)
-            logger.info("Starting migration cycle...")
-            logger.info("=" * 86)
-            
-            # Fetch current stats from all engines
-            await self._fetch_all_engine_stats()
-            
-            # Check if migration is needed
-            need_migration = self._check_migration_needed()
-            if not need_migration:
-                logger. info("✓ No migration needed (system balanced)")
-                logger.info("=" * 86)
-                return
-            
-            logger.info("⚠ Migration needed, running ILP solver...")
-            
-            # Run ILP solver
-            migration_plan = await self._solve_migration_ilp()
-            if migration_plan is None:
-                logger.warning("✗ Migration ILP solver failed or returned no plan")
-                logger.info("=" * 86)
-                return
-            
-            # Execute migration
-            logger.info("Executing migration plan...")
-            await self._execute_migration(migration_plan)
-            
-            logger.info("✓ Migration cycle complete")
-            logger.info("=" * 86)
-
-    
     async def _fetch_all_engine_stats(self):
         """Fetch comprehensive stats from all engines for migration decision"""
         session = await self._get_session()
@@ -942,6 +936,43 @@ class InstanceManager:
                 self.model_avg_exec_time[model_id] = self.default_exec_time
         
         logger.debug(f"Updated model avg exec times: {self.model_avg_exec_time}")
+
+    
+    async def _perform_migration(self):
+        """
+        Perform migration decision and execution.
+        Based on dLoRA's migration_schedule logic.
+        """
+        async with self.migration_lock:
+            logger.info("=" * 86)
+            logger.info("Starting migration cycle...")
+            logger.info("=" * 86)
+            
+            # Fetch current stats from all engines
+            await self._fetch_all_engine_stats()
+            
+            # Check if migration is needed
+            need_migration = self._check_migration_needed()
+            if not need_migration:
+                logger. info("✓ No migration needed (system balanced)")
+                logger.info("=" * 86)
+                return
+            
+            logger.info("⚠ Migration needed, running ILP solver...")
+            
+            # Run ILP solver
+            migration_plan = await self._solve_migration_ilp()
+            if migration_plan is None:
+                logger.warning("✗ Migration ILP solver failed or returned no plan")
+                logger.info("=" * 86)
+                return
+            
+            # Execute migration
+            logger.info("Executing migration plan...")
+            await self._execute_migration(migration_plan)
+            
+            logger.info("✓ Migration cycle complete")
+            logger.info("=" * 86)
 
     
     def _check_migration_needed(self) -> bool:
