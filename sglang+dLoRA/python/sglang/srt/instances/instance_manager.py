@@ -876,36 +876,49 @@ class InstanceManager:
                 logger.error(f"Migration cycle failed: {e}", exc_info=True)
                 
                 
+    # File: sglang+dLoRA/python/sglang/srt/instances/instance_manager.py
+
     async def _fetch_engine_stats(
         self,
         session: aiohttp.ClientSession,
         engine_id: int,
         url: str
     ) -> Optional[EngineStats]:
-        """Fetch detailed engine statistics"""
-        try: 
+        """Fetch detailed engine statistics for migration decision"""
+        try:  
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
+                    logger.warning(f"Engine {engine_id} stats endpoint returned status {resp.status}")
                     return None
                 
                 data = await resp.json()
-                return EngineStats.from_response(data, engine_id)
-        except Exception as e:
-            logger.debug(f"Error fetching engine stats from {engine_id}: {e}")
+                return EngineStats. from_response(data, engine_id)
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching engine stats from engine {engine_id}")
+            return None
+        except Exception as e: 
+            logger.debug(f"Error fetching engine stats from engine {engine_id}: {e}")
             return None
         
-        
+
     async def _fetch_all_engine_stats(self):
-        """Fetch comprehensive stats from all engines for migration decision"""
+        """
+        Fetch comprehensive stats from all engines for migration decision. 
+        This includes:
+        - Request metadata (for ILP solver)
+        - Model execution time (for cost estimation)
+        - Free GPU pages (for capacity planning)
+        """
         session = await self._get_session()
         
         tasks = []
         for engine_id in range(self.num_instances):
-            url = f"{self.instance_urls[engine_id]}/get_migration_stats"
+            url = f"{self.instance_urls[engine_id]}/get_migration_info"
             tasks.append(self._fetch_engine_stats(session, engine_id, url))
         
-        results = await asyncio. gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
+        # Reset aggregated stats
         self.reqs_metadata = {}
         self.model_exec_info = {i: [0, 0.0] for i in range(self.num_models)}
         
@@ -915,17 +928,29 @@ class InstanceManager:
                 self.reqs_metadata[engine_id] = []
                 continue
             
-            self.engine_stats[engine_id] = result
-            self.reqs_metadata[engine_id] = result.req_metadata
+            if result is None: 
+                logger.warning(f"Engine {engine_id} returned no stats")
+                self.reqs_metadata[engine_id] = []
+                continue
             
-            # Update model execution info
+            # Store engine stats
+            self.engine_stats[engine_id] = result
+            self.reqs_metadata[engine_id] = result. req_metadata
+            
+            # Aggregate model execution info across all engines
             for model_id_str, exec_info in result.model_exec_time.items():
                 try:
+                    # Handle both string and int model IDs
                     model_id = int(model_id_str) if isinstance(model_id_str, str) else model_id_str
-                    if 0 <= model_id < self.num_models:
+                    
+                    if 0 <= model_id < self. num_models:
+                        # exec_info is (count, total_time)
                         self.model_exec_info[model_id][0] += exec_info[0]  # count
                         self.model_exec_info[model_id][1] += exec_info[1]  # total time
-                except (ValueError, TypeError, IndexError):
+                    else:
+                        logger.warning(f"Model ID {model_id} out of range [0, {self.num_models})")
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning(f"Error processing model exec info for {model_id_str}: {e}")
                     continue
         
         # Calculate average execution times
@@ -933,18 +958,23 @@ class InstanceManager:
             if exec_info[0] > 0:
                 self.model_avg_exec_time[model_id] = exec_info[1] / exec_info[0]
             else:
+                # Use default if no data available
                 self.model_avg_exec_time[model_id] = self.default_exec_time
         
         logger.debug(f"Updated model avg exec times: {self.model_avg_exec_time}")
-        
-    
+        logger.info(f"Fetched stats from {len([r for r in results if r is not None])}/{self.num_instances} engines")
+
+
     def _check_migration_needed(self) -> bool:
         """
         Check if migration is needed based on dLoRA's criteria: 
         1. KV cache pressure imbalance
         2. Request count imbalance
+        
+        Returns:
+            True if migration should be performed, False otherwise
         """
-        # Check KV cache pressure
+        # Check 1: KV cache pressure imbalance
         engine_page_cnt = {}
         for engine_id, reqs in self.reqs_metadata.items():
             engine_page_cnt[engine_id] = sum(req.num_pages for req in reqs)
@@ -955,21 +985,27 @@ class InstanceManager:
             least_page_engine_id, least_page_cnt = sorted_pages[0]
 
             max_pages = self.num_gpu_pages[most_page_engine_id]
-            min_pages = self.num_gpu_pages[least_page_engine_id]
+            min_pages = self. num_gpu_pages[least_page_engine_id]
 
             if max_pages > 0 and min_pages > 0:
-                if (most_page_cnt >= max_pages * 0.9 and
-                    least_page_cnt < min_pages * 0.9):
-                    logger.info(f"Migration needed: KV cache imbalance "
-                              f"(engine {most_page_engine_id}: {most_page_cnt}/{max_pages} pages, "
-                              f"engine {least_page_engine_id}:  {least_page_cnt}/{min_pages} pages)")
+                # Check if one engine is nearly full (>90%) while another has room (<90%)
+                most_usage = most_page_cnt / max_pages
+                least_usage = least_page_cnt / min_pages if min_pages > 0 else 0
+                
+                if most_usage >= 0.9 and least_usage < 0.9:
+                    logger.info(
+                        f"Migration needed: KV cache imbalance detected\n"
+                        f"  Engine {most_page_engine_id}:  {most_page_cnt}/{max_pages} pages ({most_usage:.1%})\n"
+                        f"  Engine {least_page_engine_id}: {least_page_cnt}/{min_pages} pages ({least_usage:.1%})"
+                    )
                     return True
         
-        # Check request count imbalance
+        # Check 2: Request count imbalance
         engine_req_cnt = {i: len(reqs) for i, reqs in self.reqs_metadata.items()}
-        num_reqs = sum(engine_req_cnt.values())
+        num_reqs = sum(engine_req_cnt. values())
         
         if num_reqs == 0:
+            logger.debug("No active requests, migration not needed")
             return False
         
         avg_num_reqs = num_reqs / len(engine_req_cnt)
@@ -979,53 +1015,96 @@ class InstanceManager:
         imbalance = max_req_cnt - avg_num_reqs
         
         if imbalance >= self.migration_req_thres:
-            logger.info(f"Migration needed: Request imbalance "
-                      f"(max: {max_req_cnt}, avg: {avg_num_reqs:. 1f}, min: {min_req_cnt}, "
-                      f"threshold: {self.migration_req_thres})")
+            logger.info(
+                f"Migration needed: Request count imbalance detected\n"
+                f"  Max requests: {max_req_cnt}, Avg:  {avg_num_reqs:. 1f}, Min: {min_req_cnt}\n"
+                f"  Imbalance: {imbalance:. 1f} (threshold: {self.migration_req_thres})"
+            )
             return True
         
+        logger.debug(
+            f"No migration needed (requests balanced: max={max_req_cnt}, "
+            f"avg={avg_num_reqs:.1f}, imbalance={imbalance:.1f})"
+        )
         return False
 
-    
+
     async def _perform_migration(self):
         """
-        Perform migration decision and execution.
+        Perform migration decision and execution. 
         Based on dLoRA's migration_schedule logic.
+        
+        Steps:
+        1. Fetch current stats from all engines
+        2. Check if migration is needed
+        3. Solve ILP for optimal migration plan
+        4. Execute the migration plan
         """
-        async with self.migration_lock:
+        async with self. migration_lock:
             logger.info("=" * 86)
             logger.info("Starting migration cycle...")
             logger.info("=" * 86)
             
-            # Fetch current stats from all engines
-            await self._fetch_all_engine_stats()
+            # Step 1: Fetch current stats from all engines
+            try:
+                await self._fetch_all_engine_stats()
+            except Exception as e:
+                logger.error(f"Failed to fetch engine stats: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
-            # Check if migration is needed
-            need_migration = self._check_migration_needed()
+            # Step 2: Check if migration is needed
+            try:
+                need_migration = self._check_migration_needed()
+            except Exception as e:
+                logger.error(f"Error checking migration criteria: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
+            
             if not need_migration:
-                logger. info("✓ No migration needed (system balanced)")
+                logger.info("✓ No migration needed (system balanced)")
                 logger.info("=" * 86)
                 return
             
             logger.info("⚠ Migration needed, running ILP solver...")
             
-            # Run ILP solver
-            migration_plan = await self._solve_migration_ilp()
+            # Step 3: Solve ILP for optimal migration plan
+            try:
+                migration_plan = await self._solve_migration_ilp()
+            except Exception as e:
+                logger.error(f"ILP solver error: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
+            
             if migration_plan is None:
                 logger.warning("✗ Migration ILP solver failed or returned no plan")
                 logger.info("=" * 86)
                 return
             
-            # Execute migration
+            # Step 4: Execute migration
             logger.info("Executing migration plan...")
-            await self._execute_migration(migration_plan)
+            try:
+                await self._execute_migration(migration_plan)
+            except Exception as e:
+                logger.error(f"Migration execution failed: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
             logger.info("✓ Migration cycle complete")
             logger.info("=" * 86)
 
-    
+
     async def _solve_migration_ilp(self):
-        """Solve migration ILP using dLoRA's ILP solver"""
+        """
+        Solve migration ILP using dLoRA's ILP solver.
+        
+        Returns:
+            Dict containing: 
+            - req_migration:  {src_engine:  {dst_engine: [req_ids]}}
+            - lora_weights: {engine_id: [model_ids]}
+            - lora_counts: [count per model]
+            Or None if solver fails
+        """
         try:
             # Flatten all request metadata
             all_reqs_metadata = []
@@ -1043,23 +1122,33 @@ class InstanceManager:
                 reqs_metadata=all_reqs_metadata,
                 num_groups=self.num_instances,
                 num_models=self.num_models,
-                engine_gpu_blocks=self.num_gpu_blocks,
-                engine_cpu_blocks=self.num_cpu_blocks,
+                engine_gpu_blocks=self.num_gpu_pages,  # Note: using num_gpu_pages
+                engine_cpu_blocks=[0] * self.num_instances,  # SGLang doesn't use CPU blocks
                 engine_lora_capacity=self.engine_lora_capacity,
                 lora_exec_time=self.model_avg_exec_time,
-                alpha=0.05,  # Default from dLoRA
-                bw=PCIE_BANDWIDTH,
+                alpha=0.05,  # Migration overhead coefficient (from dLoRA)
+                bw=PCIE_BANDWIDTH / self.cache_page_size,  # Bandwidth in blocks/sec
                 model_engine_mapping=self.model_engine_mapping,
             )
             
-            # Solve
-            req_migration_mapping, lora_weight_mapping, lora_weight_cnt = ilp.solve()
+            # Solve (this runs in a thread pool to avoid blocking)
+            req_migration_mapping, lora_weight_mapping, lora_weight_cnt = await asyncio.get_event_loop().run_in_executor(
+                None, ilp.solve
+            )
             
             if req_migration_mapping is None: 
                 logger.warning("ILP solver returned no solution")
                 return None
             
-            logger.info(f"ILP solution:  {sum(len(dsts) for dsts in req_migration_mapping.values())} migrations planned")
+            # Count total migrations
+            total_migrations = sum(
+                len(req_ids) 
+                for dst_mapping in req_migration_mapping.values() 
+                for req_ids in dst_mapping.values()
+            )
+            
+            logger. info(f"ILP solution: {total_migrations} request migrations planned")
+            logger.debug(f"LoRA placement:  {lora_weight_mapping}")
             
             return {
                 "req_migration":  req_migration_mapping,
@@ -1070,14 +1159,18 @@ class InstanceManager:
             logger. error(f"ILP solver failed: {e}", exc_info=True)
             return None
 
-    
+
     async def _execute_migration(self, migration_plan):
         """
-        Execute migration plan.
+        Execute migration plan. 
+        
         Steps:
         1. Adjust LoRA adapters on all engines
         2. Migrate requests between engines
         3. Update internal state
+        
+        Args:
+            migration_plan: Dict from _solve_migration_ilp
         """
         req_migration = migration_plan["req_migration"]
         lora_weights = migration_plan["lora_weights"]
@@ -1086,30 +1179,47 @@ class InstanceManager:
         
         # Step 1: Adjust LoRA adapters
         logger.info("Step 1: Adjusting LoRA adapters...")
-        await self._execute_lora_adjustment(lora_weights)
+        try:
+            await self._execute_lora_adjustment(lora_weights)
+        except Exception as e:
+            logger.error(f"LoRA adjustment failed: {e}", exc_info=True)
+            # Continue anyway - request migration might still work
         
         # Step 2: Migrate requests
         logger.info("Step 2: Migrating requests...")
-        await self._execute_request_migration(req_migration)
+        try:
+            await self._execute_request_migration(req_migration)
+        except Exception as e: 
+            logger.error(f"Request migration failed: {e}", exc_info=True)
+            return
         
         # Step 3: Update internal state
+        logger. info("Step 3: Updating internal state...")
         self.engine_model_mapping = lora_weights
         
         # Rebuild reverse mapping
         self.model_engine_mapping = {i: [] for i in range(self.num_models)}
         for engine_id, model_ids in lora_weights.items():
             for model_id in model_ids:
-                self.model_engine_mapping[model_id].append(engine_id)
+                self.model_engine_mapping[model_id]. append(engine_id)
         
         logger.info("✓ Migration execution complete")
 
-    
+
     async def _execute_lora_adjustment(self, lora_weights:  Dict[int, List[int]]):
-        """Adjust LoRA adapters on all engines based on migration plan"""
+        """
+        Adjust LoRA adapters on all engines based on migration plan.
+        
+        Args:
+            lora_weights: {engine_id: [model_ids]} - target LoRA placement
+        """
         session = await self._get_session()
         
         tasks = []
         for engine_id, model_ids in lora_weights.items():
+            if engine_id >= self.num_instances:
+                logger.warning(f"Invalid engine_id {engine_id}, skipping")
+                continue
             tasks.append(self._sync_lora_adapters(session, engine_id, model_ids))
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1117,19 +1227,23 @@ class InstanceManager:
         success_count = 0
         for engine_id, result in enumerate(results):
             if isinstance(result, Exception):
-                logger. error(f"Failed to adjust LoRA on engine {engine_id}: {result}")
-            elif result.get("success", False):
+                logger.error(f"Failed to adjust LoRA on engine {engine_id}: {result}")
+            elif result. get("success", False):
                 success_count += 1
             else:
-                logger.warning(f"LoRA adjustment on engine {engine_id} had errors: {result. get('errors', [])}")
+                logger.warning(f"LoRA adjustment on engine {engine_id} had errors:  {result. get('errors', [])}")
         
-        logger.info(f"LoRA adjustment complete: {success_count}/{len(lora_weights)} engines successful")
+        logger.info(f"LoRA adjustment complete:  {success_count}/{len(lora_weights)} engines successful")
 
-    
+
     async def _execute_request_migration(self, req_migration: Dict[int, Dict[int, List[str]]]):
         """
-        Migrate requests between engines. 
+        Migrate requests between engines.
+        
         Flow:  Fetch -> Insert -> Abort
+        
+        Args:
+            req_migration: {src_engine: {dst_engine: [request_ids]}}
         """
         session = await self._get_session()
         
@@ -1141,6 +1255,12 @@ class InstanceManager:
             for dst_engine_id, request_ids in dst_mapping.items():
                 if len(request_ids) == 0:
                     continue
+                
+                # Validate engine IDs
+                if src_engine_id >= self.num_instances or dst_engine_id >= self.num_instances:
+                    logger.warning(f"Invalid engine IDs: src={src_engine_id}, dst={dst_engine_id}")
+                    continue
+                
                 url = f"{self.instance_urls[src_engine_id]}/fetch_seq_groups"
                 fetch_tasks.append(self._fetch_seq_groups(session, url, request_ids))
                 fetch_info.append((src_engine_id, dst_engine_id, request_ids))
@@ -1149,6 +1269,7 @@ class InstanceManager:
             logger. info("No requests to migrate")
             return
         
+        logger.info(f"Fetching {len(fetch_tasks)} request groups...")
         seq_groups_list = await asyncio.gather(*fetch_tasks, return_exceptions=True)
         
         # Step 2: Insert to destination engines
@@ -1160,14 +1281,23 @@ class InstanceManager:
                 continue
             
             seq_groups = seq_groups_list[idx]
-            if isinstance(seq_groups, Exception) or not seq_groups: 
-                logger.error(f"Failed to fetch seq_groups from engine {src_engine_id}:  {seq_groups}")
+            if isinstance(seq_groups, Exception):
+                logger.error(f"Failed to fetch seq_groups from engine {src_engine_id}: {seq_groups}")
+                continue
+            
+            if not seq_groups:
+                logger. warning(f"No seq_groups fetched from engine {src_engine_id} for {len(request_ids)} requests")
                 continue
             
             url = f"{self.instance_urls[dst_engine_id]}/insert_seq_groups"
             insert_tasks.append(self._insert_seq_groups(session, url, seq_groups))
             insert_info.append((src_engine_id, dst_engine_id, request_ids))
         
+        if not insert_tasks:
+            logger.warning("No seq_groups to insert")
+            return
+        
+        logger.info(f"Inserting {len(insert_tasks)} request groups...")
         insert_results = await asyncio.gather(*insert_tasks, return_exceptions=True)
         
         # Step 3: Abort from source engines
@@ -1179,7 +1309,7 @@ class InstanceManager:
             
             insert_result = insert_results[idx]
             if isinstance(insert_result, Exception):
-                logger.error(f"Failed to insert to engine {dst_engine_id}: {insert_result}")
+                logger.error(f"Failed to insert to engine {dst_engine_id}:  {insert_result}")
                 continue
             
             inserted_count = insert_result.get("count", 0)
@@ -1187,103 +1317,98 @@ class InstanceManager:
                 url = f"{self.instance_urls[src_engine_id]}/abort_requests"
                 abort_tasks.append(self._abort_requests(session, url, request_ids))
                 logger.info(f"Migrated {inserted_count} requests:  Engine {src_engine_id} -> {dst_engine_id}")
+            else:
+                logger.warning(f"Failed to insert requests from engine {src_engine_id} to {dst_engine_id}")
         
-        await asyncio.gather(*abort_tasks, return_exceptions=True)
+        if abort_tasks:
+            logger.info(f"Aborting {len(abort_tasks)} request groups from source engines...")
+            await asyncio. gather(*abort_tasks, return_exceptions=True)
 
-    
+
     async def _fetch_seq_groups(
         self,
         session: aiohttp.ClientSession,
         url: str,
         request_ids: List[str]
     ):
-        """Fetch sequence groups from an engine"""
-        try:
-            async with session.post(url, json={"request_ids": request_ids}) as resp:
+        """
+        Fetch sequence groups from an engine.
+        
+        Returns:
+            List of seq_group dicts, or None on error
+        """
+        try: 
+            async with session.post(
+                url, 
+                json={"request_ids": request_ids},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                 if resp.status != 200:
-                    logger.error(f"Failed to fetch seq_groups from {url}: status {resp.status}")
+                    error_text = await resp.text()
+                    logger.error(f"Failed to fetch seq_groups from {url}: status {resp.status}, {error_text}")
                     return None
                 data = await resp.json()
                 return data. get("seq_groups", [])
-        except Exception as e: 
-            logger.error(f"Error fetching seq groups from {url}: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching seq_groups from {url}")
+            return None
+        except Exception as e:
+            logger. error(f"Error fetching seq groups from {url}: {e}")
             return None
 
-    
+
     async def _insert_seq_groups(
         self,
-        session:  aiohttp.ClientSession,
+        session: aiohttp.ClientSession,
         url: str,
-        seq_groups: List[Dict]
+        seq_groups:  List[Dict]
     ):
-        """Insert sequence groups to an engine"""
+        """
+        Insert sequence groups to an engine.
+        
+        Returns:
+            Dict with "count" key indicating number of successfully inserted groups
+        """
         try:
-            async with session.post(url, json={"seq_groups": seq_groups}) as resp:
+            async with session.post(
+                url, 
+                json={"seq_groups": seq_groups},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                 if resp. status != 200:
-                    logger.error(f"Failed to insert seq_groups to {url}:  status {resp.status}")
+                    error_text = await resp.text()
+                    logger.error(f"Failed to insert seq_groups to {url}: status {resp.status}, {error_text}")
                     return {"count": 0}
                 return await resp.json()
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout inserting seq_groups to {url}")
+            return {"count": 0}
         except Exception as e:
             logger.error(f"Error inserting seq groups to {url}: {e}")
             return {"count": 0}
 
-    
+
     async def _abort_requests(
         self,
-        session: aiohttp.ClientSession,
+        session:  aiohttp.ClientSession,
         url: str,
         request_ids: List[str]
     ):
         """Abort requests on an engine"""
-        try: 
-            async with session.post(url, json={"request_ids":  request_ids}) as resp:
+        try:
+            async with session.post(
+                url, 
+                json={"request_ids": request_ids},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 if resp.status != 200:
-                    logger.warning(f"Failed to abort requests at {url}: status {resp.status}")
+                    error_text = await resp.text()
+                    logger. warning(f"Failed to abort requests at {url}: status {resp.status}, {error_text}")
                     return None
                 return await resp.json()
-        except Exception as e: 
-            logger.error(f"Error aborting requests at {url}:  {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout aborting requests at {url}")
             return None
-
-    
-    def get_stats(self) -> Dict:
-        """Get manager statistics for monitoring"""
-        return {
-            "num_instances": self.num_instances,
-            "num_models": self.num_models,
-            "migration_type":  self.migration_type. name,
-            "engine_request_count": self.engine_request_count,
-            "model_engine_mapping": self.model_engine_mapping,
-            "engine_model_mapping": self.engine_model_mapping,
-            "expected_lora_distribution": self. expected_lora_distribution,
-            "engine_lora_capacity": self.engine_lora_capacity,
-            "num_gpu_blocks": self.num_gpu_blocks,
-            "is_running": self._running,
-        }
-
-    
-    async def reset_stats(self):
-        """Reset statistics"""
-        self.request_to_engine. clear()
-        self.engine_request_count = {i: 0 for i in range(self.num_instances)}
-        self.global_model_request_count = {i: 0 for i in range(self.num_models)}
-        logger.info("Statistics reset")
-
-    
-    async def close(self):
-        """Close manager and cleanup resources"""
-        logger.info("Closing InstanceManager...")
-        
-        self._running = False
-        
-        if self.background_loop:
-            self.background_loop.cancel()
-            try:
-                await self.background_loop
-            except asyncio.CancelledError:
-                pass
-        
-        if self._session and not self._session.closed:
-            await self._session.close()
-        
-        logger.info("InstanceManager closed")
+        except Exception as e: 
+            logger.error(f"Error aborting requests at {url}: {e}")
+            return None
