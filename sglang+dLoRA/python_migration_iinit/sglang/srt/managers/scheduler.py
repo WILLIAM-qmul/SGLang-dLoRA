@@ -119,8 +119,6 @@ from sglang.srt.managers.io_struct import (
     GetReqModelCntReqOutput,
     GetMigrationInfoReqInput,
     GetMigrationInfoReqOutput,
-    FetchReqsInput,
-    FetchReqsOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -582,7 +580,6 @@ class Scheduler(
                 (GetInstanceStatsReqInput, self.get_instance_stats),
                 (GetReqModelCntReqInput, self.get_req_model_cnt),
                 (GetMigrationInfoReqInput, self.get_migration_info),
-                (FetchReqsInput, self.fetch_requests_stats),
             ]
         )
 
@@ -2609,37 +2606,6 @@ class Scheduler(
             model_exec_time=dict(self.model_exec_time),
             num_requests=len(req_metadata)
         )
-        
-    def fetch_requests_stats(self, recv_req: FetchReqsInput) -> FetchReqsOutput:
-        """Fetch detailed state of specific requests for migration."""
-        target_rids = set(recv_req.request_ids)
-        found_requests = []
-        
-        def serialize_req(req: Req):
-            # Reconstruct the input_ids: original prompt + generated so far
-            full_input_ids = req.origin_input_ids + req.output_ids
-            
-            return {
-                "rid": req.rid,
-                "input_ids": full_input_ids,
-                "sampling_params": req.sampling_params.to_dict() if hasattr(req.sampling_params, "to_dict") else req.sampling_params.__dict__,
-                "lora_path": req.lora_path,
-                "lora_id": req.lora_id,
-                # Add other necessary fields like image_data if multimodal
-            }
-
-        # Check waiting queue
-        for req in self.waiting_queue:
-            if req.rid in target_rids:
-                found_requests.append(serialize_req(req))
-        
-        # Check running batch
-        if self.running_batch:
-            for req in self.running_batch.reqs:
-                if req.rid in target_rids:
-                    found_requests.append(serialize_req(req))
-                    
-        return FetchReqsOutput(requests=found_requests)
 
     # NOTE: example code for get_engine_stats (not used currently)
     # def get_engine_stats(self, recv_req: GetEngineStatsReqInput):

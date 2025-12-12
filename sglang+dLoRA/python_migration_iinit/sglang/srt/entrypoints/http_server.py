@@ -319,30 +319,21 @@ app.add_middleware(
 
 
 # File: sglang+dLoRA/python/sglang/srt/entrypoints/http_server.py
-# Add these imports at the top
 
+# ... existing imports ... 
 from sglang.srt.entrypoints.http_server_extensions import (
     get_instance_stats,
     get_loaded_lora_adapters,
     get_req_model_cnt,
     get_migration_info,
-    fetch_seq_groups,
-    insert_seq_groups,
-    abort_requests as abort_requests_batch,
 )
+# ...existing code...
 
-# Add these route registrations after the existing routes
-
-# Instance manager endpoints
 app.add_api_route("/get_instance_stats", get_instance_stats, methods=["GET"])
 app.add_api_route("/get_loaded_lora_adapters", get_loaded_lora_adapters, methods=["GET"])
 app.add_api_route("/get_req_model_cnt", get_req_model_cnt, methods=["GET"])
 app.add_api_route("/get_migration_info", get_migration_info, methods=["GET"])
-
-# Migration endpoints
-app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
-app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])
-app.add_api_route("/abort_requests", abort_requests_batch, methods=["POST"])
+# ...existing code...
 
 
 @app.exception_handler(HTTPException)

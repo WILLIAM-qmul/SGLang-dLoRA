@@ -8,8 +8,6 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 import logging
 import time
-import asyncio
-from sglang.srt.managers.io_struct import GenerateReqInput
 
 logger = logging.getLogger(__name__)
 
@@ -122,88 +120,6 @@ async def get_migration_info(request:  Request):
     
     except Exception as e:
         logger.error(f"Failed to get migration info: {e}")
-        return JSONResponse(
-            {"error": str(e)},
-            status_code=500
-        )
-        
-
-async def fetch_seq_groups(request: Request):
-    """Endpoint to fetch request states for migration."""
-    from sglang.srt.entrypoints.http_server import _global_state
-    data = await request.json()
-    request_ids = data.get("request_ids", [])
-    
-    if not request_ids:
-        return JSONResponse({"seq_groups": []})
-        
-    seq_groups = await _global_state.tokenizer_manager.fetch_requests(request_ids)
-    return JSONResponse({"seq_groups": seq_groups})
-
-
-async def insert_seq_groups(request: Request):
-    """Endpoint to insert migrated requests."""
-    from sglang.srt.entrypoints.http_server import _global_state
-    data = await request.json()
-    seq_groups = data.get("seq_groups", [])
-    
-    count = 0
-    for seq_data in seq_groups:
-        try:
-            # Convert dict back to GenerateReqInput
-            # Ensure we use input_ids to skip tokenization overhead
-            obj = GenerateReqInput(
-                rid=seq_data.get("rid"),
-                input_ids=seq_data.get("input_ids"),
-                sampling_params=seq_data.get("sampling_params"),
-                lora_path=seq_data.get("lora_path"),
-                # Map other fields...
-            )
-            # Submit to tokenizer manager (fire and forget for migration)
-            asyncio.create_task(_global_state.tokenizer_manager.generate_request(obj, request))
-            count += 1
-        except Exception as e:
-            logger.error(f"Failed to insert migrated request: {e}")
-            
-    return JSONResponse({"count": count})
-
-
-async def abort_requests(request: Request):
-    """
-    Abort multiple requests. 
-    This is used after migration to clean up source engine. 
-    
-    Request body: 
-        {
-            "request_ids": ["req1", "req2", ...]
-        }
-    
-    Returns:
-        {
-            "aborted_count": number of aborted requests
-        }
-    """
-    from sglang.srt.entrypoints.http_server import _global_state
-    
-    tokenizer_manager = _global_state.tokenizer_manager
-    
-    try:
-        body = await request.json()
-        request_ids = body.get("request_ids", [])
-        
-        if not request_ids:
-            return JSONResponse({"aborted_count": 0})
-        
-        # Abort requests
-        for request_id in request_ids: 
-            tokenizer_manager.abort_request(rid=request_id)
-        
-        return JSONResponse({
-            "aborted_count":  len(request_ids)
-        })
-    
-    except Exception as e:
-        logger.error(f"Failed to abort requests: {e}")
         return JSONResponse(
             {"error": str(e)},
             status_code=500

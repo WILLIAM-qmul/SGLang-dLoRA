@@ -23,8 +23,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple
 
-import dataclasses 
-
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -1558,7 +1556,6 @@ class LazyDumpTensorsReqOutput(BaseReq):
 
 # --- New additions for EngineManager integration ---
 
-
 @dataclass
 class GetInstanceStatsReqInput(BaseReq):
     pass
@@ -1569,8 +1566,7 @@ class GetInstanceStatsReqOutput(BaseReq):
     available_gpu_memory: float
     num_free_gpu_pages: int
     cache_page_size: int
- 
-   
+    
 @dataclass
 class GetReqModelCntReqInput(BaseReq):
     """Request input for getting request model count statistics"""
@@ -1608,11 +1604,11 @@ class RequestMetadata:
             output_length=len(req.output_ids) if hasattr(req, 'output_ids') else 0
         )
 
-
 @dataclass
 class GetMigrationInfoReqInput(BaseReq):
     """Request to get migration information from scheduler"""
     pass
+
 
 @dataclass
 class GetMigrationInfoReqOutput(BaseReq):
@@ -1623,15 +1619,6 @@ class GetMigrationInfoReqOutput(BaseReq):
     model_exec_time: Dict[str, Tuple[int, float]]
     # Total number of requests
     num_requests: int = 0
-
-
-class FetchReqsInput(BaseReq):
-    request_ids: List[str]
-
-@dataclass
-class FetchReqsOutput(BaseReq):
-    requests: List[Dict]
-    success: bool = True
 
 
 def _check_all_req_types():
