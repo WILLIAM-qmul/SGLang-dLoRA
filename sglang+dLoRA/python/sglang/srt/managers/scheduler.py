@@ -2570,28 +2570,19 @@ class Scheduler(
         req_metadata = []
         
         def process_req(req, in_gpu: bool):
-            # Use lora_id as model identifier (None = base model)
-            model_id = req.lora_id if req.lora_id else None
-            
             # Calculate KV cache blocks
-            if in_gpu:
-                # Running requests: calculate from allocated tokens (input + output generated so far)
-                num_tokens = len(req.fill_ids) if req.fill_ids else (len(req.origin_input_ids) + len(req.output_ids))
-            else:
-                # Waiting requests: estimate from prompt length
-                num_tokens = len(req.origin_input_ids)
-            
-            num_pages = 0
-            if self.page_size > 0:
-                num_blocks = (num_tokens + self.page_size - 1) // self.page_size
+            # Use origin_input_ids + output_ids to cover both fresh and retracted requests
+            # Waiting requests might be retracted ones which have output_ids, so we cannot just use origin_input_ids
+            num_tokens = len(req.origin_input_ids) + len(req.output_ids)
+            num_blocks = (num_tokens + self.page_size - 1) // self.page_size
             
             req_metadata.append({
-                "request_id": req.rid,
-                "model_id": model_id,
-                "num_pages": num_pages,
+                "rid": req.rid,
+                "model_id": req.lora_id if req.lora_id is not None else -1,  # Use -1 for base model
+                "num_tokens": num_tokens,
+                "num_blocks": num_blocks,
+                "priority": req.priority if req.priority is not None else 0,
                 "in_gpu": in_gpu,
-                "prompt_length": len(req.origin_input_ids),
-                "output_length": len(req.output_ids) if in_gpu else req.sampling_params.max_new_tokens,
             })
 
         # 1. Collect metadata from waiting queue
@@ -2640,114 +2631,6 @@ class Scheduler(
                     found_requests.append(serialize_req(req))
                     
         return FetchReqsOutput(requests=found_requests)
-
-    # NOTE: example code for get_engine_stats (not used currently)
-    # def get_engine_stats(self, recv_req: GetEngineStatsReqInput):
-    #     """
-    #     Get engine statistics for migration decision (adapted from dLoRA). 
-    #     Uses actual SGLang storage structures - no simulation. 
-    #     """
-    #     # 1. Count total requests-ok
-    #     num_running_requests = len(self.running_batch.reqs) if self.running_batch else 0
-    #     num_waiting_requests = len(self.waiting_queue)
-    #     num_requests = num_running_requests + num_waiting_requests
-        
-    #     # 2. Count requests per LoRA model
-    #     req_model_cnt = defaultdict(int)
-    #     req_metadata = []
-    #     # active_models = set()
-    #     model_exec_time = defaultdict(lambda: [0, 0.0])  # [count, total_time]
-        
-    #     def process_req(req, in_gpu: bool):
-    #         """Process a single request to extract statistics"""
-    #         # Use lora_id as model identifier (None = base model)
-    #         model_id = req.lora_id if hasattr(req, 'lora_id') and req.lora_id else None
-    #         req_model_cnt[model_id] += 1
-            
-    #         # Track active LoRA models
-    #         # if model_id is not None:
-    #         #     active_models.add(model_id)
-            
-    #         # Calculate KV cache blocks for this request
-    #         num_blocks = 0
-    #         if in_gpu and hasattr(req, 'req_pool_idx'):
-    #             # Running requests: calculate from allocated tokens
-    #             num_tokens = len(req.fill_ids) if hasattr(req, 'fill_ids') else 0
-    #             num_blocks = (num_tokens + self.req_to_token_pool. size - 1) // self.req_to_token_pool.size
-    #         elif not in_gpu:
-    #             # Waiting requests: estimate from prompt length
-    #             prompt_len = len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0
-    #             estimated_tokens = prompt_len + (req.sampling_params.max_new_tokens if hasattr(req, 'sampling_params') else 0)
-    #             num_blocks = (estimated_tokens + self.req_to_token_pool.size - 1) // self.req_to_token_pool.size
-            
-    #         # Only include waiting requests in metadata (for migration consideration)
-    #         if not in_gpu:
-    #             req_metadata.append({
-    #                 "request_id": req.rid,
-    #                 "model_id": model_id,
-    #                 "num_blocks": num_blocks,
-    #                 "in_gpu": in_gpu,
-    #                 "prompt_length": len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else 0,
-    #                 "output_length": req.sampling_params. max_new_tokens if hasattr(req, 'sampling_params') else 0,
-    #             })
-            
-    #         # Track execution time for running requests
-    #         if in_gpu and hasattr(req, 'created_time'):
-    #             exec_time = time.time() - req.created_time
-    #             model_exec_time[model_id][0] += 1
-    #             model_exec_time[model_id][1] += exec_time
-        
-    #     # Process running requests
-    #     if self.running_batch:
-    #         for req in self.running_batch.reqs:
-    #             process_req(req, in_gpu=True)
-        
-    #     # Process waiting requests
-    #     for req in self.waiting_queue:
-    #         process_req(req, in_gpu=False)
-
-    #     # 3. Calculate free GPU pages (actual, not estimated)-ok
-    #     num_free_gpu_pages = self.token_to_kv_pool_allocator.available_size() // self.page_size
-        
-    #     # 4. Get available GPU memory (in bytes)-ok
-    #     available_gpu_memory = get_available_gpu_memory(
-    #         self.device, 
-    #         self.gpu_id, 
-    #         empty_cache=False
-    #     ) * (1 << 30)  # Convert GB to bytes
-
-    #     # 5. Calculate cache page size (in bytes)-ok
-    #     '''method 1: based on k/v buffer shapes'''
-    #     # kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-    #     # k_page_size = kv_cache.k_buffer[0][0].nbytes * kv_cache.page_size
-    #     # v_page_size = kv_cache.v_buffer[0][0].nbytes * kv_cache.page_size
-    #     # cache_page_size = (k_page_size + v_page_size) * kv_cache.layer_num
-    #     '''method 2: based on total kv size and total tokens'''
-    #     kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-    #     page_size = self.token_to_kv_pool_allocator.page_size
-    #     total_kv_bytes_tuple = kv_cache.get_kv_size_bytes()  # 返回 (k_bytes, v_bytes)
-    #     total_kv_bytes = sum(total_kv_bytes_tuple)           # 修复：取总和
-    #     total_tokens = kv_cache.size
-    #     bytes_per_token = total_kv_bytes / total_tokens if total_tokens > 0 else 0
-    #     cache_page_size = int(bytes_per_token * page_size)
-        
-    #     # 6. Get LoRA capacity-ok
-    #     lora_capacity = self.max_loras_per_batch if self.enable_lora else 0
-
-    #     # 7.  Construct response-ok
-    #     res = GetEngineStatsReqOutput(
-    #         num_requests=num_requests,
-    #         req_model_cnt=dict(req_model_cnt),
-    #         num_free_gpu_pages=num_free_gpu_pages,
-    #         req_metadata=req_metadata,
-    #         lora_capacity=lora_capacity,
-    #         available_gpu_memory=available_gpu_memory,
-    #         cache_page_size=cache_page_size,
-    #         model_exec_time=dict(model_exec_time),
-    #         # active_models=list(active_models),
-    #     )
-        
-    #     return res
     
 
     def get_internal_state(self, recv_req: GetInternalStateReq):

@@ -7,7 +7,7 @@ import heapq
 from typing import Iterable, Optional, Dict, List, Tuple, Iterator
 from collections import OrderedDict
 
-from workload_generator.workload import ArrivalProcess, GammaProcess, PoissonProcess
+from .workload import ArrivalProcess, GammaProcess, PoissonProcess
 
 def load_trace(trace_name, trace_dir, duration_list, end_d, end_h, end_m, start_d=0, start_h=0, start_m=0, need_sort=False):
     if trace_name == "azure_v1":

@@ -1557,6 +1557,61 @@ class LazyDumpTensorsReqOutput(BaseReq):
 
 
 # --- New additions for EngineManager integration ---
+@dataclass
+class InstanceStats: # ✅
+    """Statistics for a single instance"""
+    engine_id: int
+    lora_capacity: int
+    available_gpu_memory: float
+    num_free_gpu_pages: int
+    cache_page_size: int
+    
+    @classmethod
+    def from_dict(cls, data: Dict, engine_id: int) -> "InstanceStats":
+        return cls(
+            engine_id=engine_id,
+            lora_capacity=data["lora_capacity"],
+            available_gpu_memory=data["available_gpu_memory"],
+            num_free_gpu_pages=data["num_free_gpu_pages"],
+            cache_page_size=data["cache_page_size"],
+        )
+        
+
+@dataclass
+class ReqModelCntStats: # ✅
+    """Lightweight statistics for request model count only"""
+    engine_id: int
+    req_model_cnt: Dict[str, int]  # model_id -> request count
+    exec_cost: float = 0.0
+    engine_num_requests: int = 0
+    
+    @classmethod
+    def from_response(cls, data: Dict, engine_id: int) -> "ReqModelCntStats": 
+        """Parse response from scheduler"""
+        return cls(
+            engine_id=engine_id,
+            req_model_cnt=data.get("req_model_cnt", {}),
+            exec_cost=data.get("exec_cost", 0.0),
+            engine_num_requests=data.get("total_requests", 0)
+        )
+
+
+@dataclass
+class EngineStats:
+    """Detailed statistics for a single engine, for migration decision."""
+    engine_id: int
+    req_metadata: List[Dict[str, Any]]  # List of request metadata dicts
+    model_exec_time: Dict[str, Tuple[int, float]]  # model_id -> (count, total_time)
+    num_requests: int = 0
+
+    @classmethod
+    def from_response(cls, data: Dict, engine_id: int) -> "EngineStats":
+        return cls(
+            engine_id=engine_id,
+            req_metadata=data.get("req_metadata", []),
+            model_exec_time=data.get("model_exec_time", {}),
+            num_requests=data.get("num_requests", 0),
+        )
 
 
 @dataclass

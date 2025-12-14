@@ -9,9 +9,10 @@ import math
 import random
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 
+from sglang.srt.managers.io_struct import InstanceStats, ReqModelCntStats, RequestMetadata, EngineStats
 from sglang.srt.instances.lora_config_paths import NUM_LORAS, LORA_PATH
 from sglang.srt.instances.lora_init import get_lora_sizes_for_instance_manager
 from sglang.srt.instances.migration_ilp import MigrationILP
@@ -26,104 +27,6 @@ class MigrationType(Enum): # ✅
     DISPATCH_ONLY = 1
     DISPATCH_MIG = 2
     PERIOD_MIG = 3
-    
-    
-@dataclass
-class InstanceStats: # ✅
-    """Statistics for a single instance"""
-    engine_id: int
-    lora_capacity: int
-    available_gpu_memory: float
-    num_free_gpu_pages: int
-    cache_page_size: int
-    
-    @classmethod
-    def from_dict(cls, data: Dict, engine_id: int) -> "InstanceStats":
-        return cls(
-            engine_id=engine_id,
-            lora_capacity=data["lora_capacity"],
-            available_gpu_memory=data["available_gpu_memory"],
-            num_free_gpu_pages=data["num_free_gpu_pages"],
-            cache_page_size=data["cache_page_size"],
-        )
-        
-
-@dataclass
-class ReqModelCntStats: # ✅
-    """Lightweight statistics for request model count only"""
-    engine_id: int
-    req_model_cnt: Dict[str, int]  # model_id -> request count
-    exec_cost: float = 0.0
-    engine_num_requests: int = 0
-    
-    @classmethod
-    def from_response(cls, data: Dict, engine_id: int) -> "ReqModelCntStats": 
-        """Parse response from scheduler"""
-        return cls(
-            engine_id=engine_id,
-            req_model_cnt=data.get("req_model_cnt", {}),
-            exec_cost=data.get("exec_cost", 0.0),
-            engine_num_requests=data.get("total_requests", 0)
-        )
-
-
-@dataclass
-class RequestMetadata:
-    """Metadata for a single request"""
-    request_id:  str
-    model_id: Optional[str]
-    engine_id: int
-    num_pages: int
-    in_gpu: bool
-    prompt_length: int = 0
-    output_length: int = 0
-    
-    @classmethod
-    def from_dict(cls, data: Dict, engine_id: int) -> "RequestMetadata":
-        return cls(
-            request_id=data["request_id"],
-            model_id=data.get("model_id"),
-            engine_id=engine_id,
-            num_pages=data["num_pages"],
-            in_gpu=data["in_gpu"],
-            prompt_length=data. get("prompt_length", 0),
-            output_length=data.get("output_length", 0),
-        )
-
-
-@dataclass
-class EngineStats:
-    engine_id: int
-    num_requests: int
-    req_model_cnt: Dict[int, int]
-    num_free_gpu_pages: int
-    lora_capacity: int
-    req_metadata: List[RequestMetadata]
-    model_exec_time: Dict[int, Tuple[int, float]]
-    available_gpu_memory: float
-    cache_page_size: int
-    # active_models: List[int]
-    
-    @classmethod
-    def from_response(cls, data: Dict, engine_id: int) -> "EngineStats":
-        req_metadata = [
-            RequestMetadata.from_dict(req_data, engine_id)
-            for req_data in data. get("req_metadata", [])
-        ]
-        
-        return cls(
-            engine_id=engine_id,
-            num_requests=data["num_requests"],
-            req_model_cnt=data. get("req_model_cnt", {}),
-            num_free_gpu_pages=data["num_free_gpu_pages"],
-            lora_capacity=data. get("lora_capacity", 8),
-            req_metadata=req_metadata,
-            model_exec_time=data.get("model_exec_time", {}),
-            available_gpu_memory=data.get("available_gpu_memory", 10.0 * _GB),
-            cache_page_size=data.get("cache_page_size", 4096),
-            # active_models=data.get("active_models", []),
-        )
-
 
 
 class InstanceManager:
@@ -196,7 +99,7 @@ class InstanceManager:
         
         # Statistics
         self.reqs_metadata: Dict[int, List[RequestMetadata]] = {}
-        self.instance_stats: Dict[int, EngineStats] = {}
+        self.instance_stats: Dict[int, InstanceStats] = {}
         self.engine_stats: Dict[int, EngineStats] = {}
         self.global_model_request_count: Dict[int, int] = {i: 0 for i in range(num_models)}
         self.engine_exec_cost: Dict[int, float] = {}
@@ -530,38 +433,81 @@ class InstanceManager:
             "success": True,
         }
         
-        # Unload adapters first to free up capacity
-        for lora_name in to_unload:
+        # # Unload adapters first to free up capacity
+        # for lora_name in to_unload:
+        #     try:
+        #         success = await self._unload_lora_adapter(session, base_url, lora_name)
+        #         if success:
+        #             results["unloaded"].append(lora_name)
+        #             logger.debug(f"Engine {engine_id}:  Unloaded {lora_name}")
+        #         else:
+        #             results["errors"]. append(f"Failed to unload {lora_name}")
+        #             results["success"] = False
+        #     except Exception as e:
+        #         error_msg = f"Error unloading {lora_name}: {e}"
+        #         results["errors"].append(error_msg)
+        #         results["success"] = False
+        #         logger.error(f"Engine {engine_id}: {error_msg}")
+        
+        # # Load new adapters
+        # for lora_name in to_load:
+        #     # Extract model_id from lora_name (e.g., "lora0" -> 0)
+        #     try:
+        #         model_id = int(lora_name.replace("lora", ""))
+        #         lora_path = LORA_PATH.get(lora_name)
+                
+        #         if not lora_path:
+        #             error_msg = f"LoRA path not found for {lora_name}"
+        #             results["errors"]. append(error_msg)
+        #             results["success"] = False
+        #             logger.error(f"Engine {engine_id}: {error_msg}")
+        #             continue
+                
+        #         loaded_adapters = await self._load_lora_adapter(session, base_url, lora_name, lora_path)
+                
+        #         if loaded_adapters and lora_name in loaded_adapters:
+        #             results["loaded"].append(lora_name)
+        #             logger.debug(f"Engine {engine_id}: Loaded {lora_name} from {lora_path}")
+        #         else:
+        #             error_msg = f"Failed to load {lora_name}"
+        #             results["errors"].append(error_msg)
+        #             results["success"] = False
+        #             logger.warning(f"Engine {engine_id}: {error_msg}")
+                    
+        #     except Exception as e:
+        #         error_msg = f"Error loading {lora_name}: {e}"
+        #         results["errors"].append(error_msg)
+        #         results["success"] = False
+        #         logger.error(f"Engine {engine_id}: {error_msg}")
+        async def unload_one(lora_name):
             try:
                 success = await self._unload_lora_adapter(session, base_url, lora_name)
                 if success:
                     results["unloaded"].append(lora_name)
                     logger.debug(f"Engine {engine_id}:  Unloaded {lora_name}")
                 else:
-                    results["errors"]. append(f"Failed to unload {lora_name}")
+                    results["errors"].append(f"Failed to unload {lora_name}")
                     results["success"] = False
             except Exception as e:
                 error_msg = f"Error unloading {lora_name}: {e}"
                 results["errors"].append(error_msg)
                 results["success"] = False
                 logger.error(f"Engine {engine_id}: {error_msg}")
-        
-        # Load new adapters
-        for lora_name in to_load:
-            # Extract model_id from lora_name (e.g., "lora0" -> 0)
+
+        await asyncio.gather(*(unload_one(lora_name) for lora_name in to_unload))
+
+        # Load adapters in parallel
+        async def load_one(lora_name):
             try:
                 model_id = int(lora_name.replace("lora", ""))
                 lora_path = LORA_PATH.get(lora_name)
-                
                 if not lora_path:
                     error_msg = f"LoRA path not found for {lora_name}"
-                    results["errors"]. append(error_msg)
+                    results["errors"].append(error_msg)
                     results["success"] = False
                     logger.error(f"Engine {engine_id}: {error_msg}")
-                    continue
-                
+                    return
                 loaded_adapters = await self._load_lora_adapter(session, base_url, lora_name, lora_path)
-                
                 if loaded_adapters and lora_name in loaded_adapters:
                     results["loaded"].append(lora_name)
                     logger.debug(f"Engine {engine_id}: Loaded {lora_name} from {lora_path}")
@@ -570,12 +516,13 @@ class InstanceManager:
                     results["errors"].append(error_msg)
                     results["success"] = False
                     logger.warning(f"Engine {engine_id}: {error_msg}")
-                    
             except Exception as e:
                 error_msg = f"Error loading {lora_name}: {e}"
                 results["errors"].append(error_msg)
                 results["success"] = False
                 logger.error(f"Engine {engine_id}: {error_msg}")
+
+        await asyncio.gather(*(load_one(lora_name) for lora_name in to_load))
         
         # Get final state
         final_loaded = await self._get_loaded_adapters(session, base_url)
@@ -878,13 +825,16 @@ class InstanceManager:
                 
     # File: sglang+dLoRA/python/sglang/srt/instances/instance_manager.py
 
-    async def _fetch_engine_stats(
+    async def _fetch_engine_stats( # ✅
         self,
         session: aiohttp.ClientSession,
         engine_id: int,
         url: str
     ) -> Optional[EngineStats]:
-        """Fetch detailed engine statistics for migration decision"""
+        """
+        Fetch detailed engine statistics for migration decision.
+        Equivalent to dLoRA's get_migration_info per engine.
+        """
         try:  
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
@@ -892,22 +842,29 @@ class InstanceManager:
                     return None
                 
                 data = await resp.json()
-                return EngineStats. from_response(data, engine_id)
+                return EngineStats.from_response(data, engine_id)
         except asyncio.TimeoutError:
             logger.error(f"Timeout fetching engine stats from engine {engine_id}")
             return None
-        except Exception as e: 
+        except Exception as e:  
             logger.debug(f"Error fetching engine stats from engine {engine_id}: {e}")
             return None
-        
 
-    async def _fetch_all_engine_stats(self):
+
+    async def _fetch_all_engine_stats(self): # ✅
         """
-        Fetch comprehensive stats from all engines for migration decision. 
+        Fetch comprehensive stats from all engines for migration decision.
+        Equivalent to dLoRA's get_migration_info() method.
+        
         This includes:
         - Request metadata (for ILP solver)
         - Model execution time (for cost estimation)
         - Free GPU pages (for capacity planning)
+        
+        Updates:
+        - self.reqs_metadata: {engine_id: [RequestMetadata]}
+        - self.model_exec_info: {model_id: [count, total_time]}
+        - self.model_avg_exec_time: [avg_time per model]
         """
         session = await self._get_session()
         
@@ -918,42 +875,40 @@ class InstanceManager:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Reset aggregated stats
-        self.reqs_metadata = {}
-        self.model_exec_info = {i: [0, 0.0] for i in range(self.num_models)}
-        
         for engine_id, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Failed to fetch stats from engine {engine_id}: {result}")
+                logger. error(f"Failed to fetch stats from engine {engine_id}: {result}")
                 self.reqs_metadata[engine_id] = []
                 continue
             
-            if result is None: 
+            if result is None:  
                 logger.warning(f"Engine {engine_id} returned no stats")
                 self.reqs_metadata[engine_id] = []
                 continue
             
-            # Store engine stats
+            # Store request metadata for this engine
             self.engine_stats[engine_id] = result
-            self.reqs_metadata[engine_id] = result. req_metadata
+            self.reqs_metadata[engine_id] = result.req_metadata
             
-            # Aggregate model execution info across all engines
+            # Aggregate model execution info across all engines (like dLoRA)
             for model_id_str, exec_info in result.model_exec_time.items():
                 try:
                     # Handle both string and int model IDs
-                    model_id = int(model_id_str) if isinstance(model_id_str, str) else model_id_str
-                    
-                    if 0 <= model_id < self. num_models:
+                    model_id = int(model_id_str)
+
+                    if 0 <= model_id < self.num_models:
                         # exec_info is (count, total_time)
                         self.model_exec_info[model_id][0] += exec_info[0]  # count
                         self.model_exec_info[model_id][1] += exec_info[1]  # total time
                     else:
-                        logger.warning(f"Model ID {model_id} out of range [0, {self.num_models})")
-                except (ValueError, TypeError, IndexError) as e:
-                    logger.warning(f"Error processing model exec info for {model_id_str}: {e}")
+                        # Log base model (-1) or out-of-range models at debug level
+                        logger.debug(f"Skipping model exec info for model ID {model_id} (out of range or base model)")
+                except (ValueError, TypeError) as e:
+                    # Log other invalid model_id strings (like 'null' or UUIDs) at debug level
+                    logger.debug(f"Error processing model exec info for '{model_id_str}': {e}")
                     continue
         
-        # Calculate average execution times
+        # Calculate average execution times (like dLoRA)
         for model_id, exec_info in self.model_exec_info.items():
             if exec_info[0] > 0:
                 self.model_avg_exec_time[model_id] = exec_info[1] / exec_info[0]
@@ -965,173 +920,315 @@ class InstanceManager:
         logger.info(f"Fetched stats from {len([r for r in results if r is not None])}/{self.num_instances} engines")
 
 
-    def _check_migration_needed(self) -> bool:
+    def _check_migration_needed(self) -> Tuple[bool, Optional[List[int]]]:
         """
-        Check if migration is needed based on dLoRA's criteria: 
-        1. KV cache pressure imbalance
-        2. Request count imbalance
+        Check if migration is needed based on dLoRA's criteria.
+        Returns both decision and the engines to participate in ILP. 
+        
+        Criteria (from dLoRA):
+        1. KV cache pressure imbalance: one engine >90% full, another <90% full
+        2. Request count imbalance: max_requests - avg_requests >= threshold
         
         Returns:
-            True if migration should be performed, False otherwise
+            (need_migration, ilp_engines):
+                - need_migration: bool, whether to perform migration
+                - ilp_engines: List[int] or None, engines to include in ILP solver
         """
-        # Check 1: KV cache pressure imbalance
-        engine_page_cnt = {}
-        for engine_id, reqs in self.reqs_metadata.items():
-            engine_page_cnt[engine_id] = sum(req.num_pages for req in reqs)
-        
+        # Check 1: KV cache pressure imbalance (PRIORITY)
+        engine_page_cnt = {
+            i: sum(req["num_blocks"] for req in self.reqs_metadata.get(i, []))
+            for i in range(self.num_instances)
+        }
+
         if engine_page_cnt:
             sorted_pages = sorted(engine_page_cnt.items(), key=lambda x: x[1])
             most_page_engine_id, most_page_cnt = sorted_pages[-1]
             least_page_engine_id, least_page_cnt = sorted_pages[0]
 
             max_pages = self.num_gpu_pages[most_page_engine_id]
-            min_pages = self. num_gpu_pages[least_page_engine_id]
+            min_pages = self.num_gpu_pages[least_page_engine_id]
 
             if max_pages > 0 and min_pages > 0:
-                # Check if one engine is nearly full (>90%) while another has room (<90%)
                 most_usage = most_page_cnt / max_pages
                 least_usage = least_page_cnt / min_pages if min_pages > 0 else 0
                 
+                # KV cache imbalance detected (like dLoRA)
                 if most_usage >= 0.9 and least_usage < 0.9:
+                    ilp_engines = sorted([most_page_engine_id, least_page_engine_id])
                     logger.info(
                         f"Migration needed: KV cache imbalance detected\n"
                         f"  Engine {most_page_engine_id}:  {most_page_cnt}/{max_pages} pages ({most_usage:.1%})\n"
-                        f"  Engine {least_page_engine_id}: {least_page_cnt}/{min_pages} pages ({least_usage:.1%})"
+                        f"  Engine {least_page_engine_id}: {least_page_cnt}/{min_pages} pages ({least_usage:.1%})\n"
+                        f"  ILP engines: {ilp_engines}"
                     )
-                    return True
+                    return True, ilp_engines
         
-        # Check 2: Request count imbalance
+        # Check 2: Request count imbalance (SECONDARY)
         engine_req_cnt = {i: len(reqs) for i, reqs in self.reqs_metadata.items()}
         num_reqs = sum(engine_req_cnt. values())
         
         if num_reqs == 0:
             logger.debug("No active requests, migration not needed")
-            return False
+            return False, None
         
-        avg_num_reqs = num_reqs / len(engine_req_cnt)
-        max_req_cnt = max(engine_req_cnt.values())
-        min_req_cnt = min(engine_req_cnt.values())
+        # Sort by request count
+        sorted_req_cnt = sorted(engine_req_cnt.items(), key=lambda x: x[1])
         
-        imbalance = max_req_cnt - avg_num_reqs
+        # Try to find imbalanced engines (like dLoRA's matching algorithm)
+        matched_engines = []
+        remaining_engines = list(sorted_req_cnt)
         
-        if imbalance >= self.migration_req_thres:
-            logger.info(
-                f"Migration needed: Request count imbalance detected\n"
-                f"  Max requests: {max_req_cnt}, Avg:  {avg_num_reqs:. 1f}, Min: {min_req_cnt}\n"
-                f"  Imbalance: {imbalance:. 1f} (threshold: {self.migration_req_thres})"
-            )
-            return True
+        while remaining_engines:
+            avg_num_reqs = sum(cnt for _, cnt in remaining_engines) / len(remaining_engines)
+            most_req_engine_id, most_req_engine_cnt = remaining_engines. pop()
+            
+            delta = most_req_engine_cnt - avg_num_reqs
+            
+            # Not imbalanced enough
+            if delta < self.migration_req_thres:
+                break
+            
+            # Try to match with underloaded engines
+            for engine_id, cnt in remaining_engines: 
+                if delta <= 0 or len(matched_engines) > 0:
+                    break
+                
+                to_fill = avg_num_reqs - cnt
+                if to_fill <= 0:
+                    break
+                
+                to_fill = min(to_fill, delta)
+                matched_engines.append(engine_id)
+                delta -= to_fill
+            
+            # Found matches
+            if matched_engines:
+                ilp_engines = sorted([most_req_engine_id] + matched_engines)
+                logger.info(
+                    f"Migration needed: Request count imbalance detected\n"
+                    f"  Max requests: {most_req_engine_cnt}, Avg:  {avg_num_reqs:.1f}\n"
+                    f"  Imbalance: {delta:.1f} (threshold: {self.migration_req_thres})\n"
+                    f"  ILP engines: {ilp_engines}"
+                )
+                return True, ilp_engines
         
         logger.debug(
-            f"No migration needed (requests balanced: max={max_req_cnt}, "
-            f"avg={avg_num_reqs:.1f}, imbalance={imbalance:.1f})"
+            f"No migration needed (system balanced:  "
+            f"max={max(engine_req_cnt. values()) if engine_req_cnt else 0}, "
+            f"avg={num_reqs/len(engine_req_cnt) if engine_req_cnt else 0:.1f})"
         )
-        return False
+        return False, None
+
+
+    def _prepare_ilp_problem(self, ilp_engines: List[int]) -> Dict:
+        """
+        Prepare ILP problem with index remapping.
+        Equivalent to dLoRA's remapping logic in migration_schedule.
+        
+        Args:
+            ilp_engines: List of engine IDs to include in ILP
+            
+        Returns:
+            Dict with: 
+            - ilp_reqs_metadata: List of RequestMetadata with remapped indices
+            - ilp_num_groups: Number of engines in ILP
+            - ilp_num_models: Number of models in ILP
+            - ilp_num_gpu_blocks: GPU blocks per engine
+            - ilp_num_cpu_blocks: CPU blocks per engine
+            - ilp_lora_capacity: LoRA capacity per engine
+            - ilp_model_avg_exec_time:  Avg exec time per model
+            - ilp_model_engine_mapping: Model->engine mapping
+            - ilp_engine_mapping: Original->ILP engine ID mapping
+            - ilp_model_mapping: Original->ILP model ID mapping
+        """
+        # Create engine index mapping (original engine_id -> ilp engine_id)
+        ilp_engine_mapping = {ilp_engines[i]: i for i in range(len(ilp_engines))}
+        
+        # Collect all models used by ILP engines
+        ilp_models = set()
+        for engine_id in ilp_engines: 
+            for model_id in self.engine_model_mapping[engine_id]:
+                ilp_models.add(model_id)
+        ilp_models = sorted(list(ilp_models))
+        
+        # Create model index mapping (original model_id -> ilp model_id)
+        ilp_model_mapping = {ilp_models[i]: i for i in range(len(ilp_models))}
+        
+        # Collect and remap request metadata
+        ilp_reqs_metadata = []
+        for engine_id in ilp_engines: 
+            for req_metadata in self.reqs_metadata[engine_id]:
+                # Remap engine and model IDs
+                req_metadata.engine_id = ilp_engine_mapping[engine_id]
+                req_metadata.model_id = ilp_model_mapping[req_metadata.model_id]
+                ilp_reqs_metadata.append(req_metadata)
+        
+        # Prepare ILP parameters
+        ilp_num_groups = len(ilp_engines)
+        ilp_num_models = len(ilp_models)
+        ilp_num_gpu_pages = [self.num_gpu_pages[engine_id] for engine_id in ilp_engines]
+        ilp_num_cpu_pages = [0] * ilp_num_groups  # SGLang doesn't use CPU blocks
+        ilp_lora_capacity = [len(self.engine_model_mapping[engine_id]) for engine_id in ilp_engines]
+        ilp_model_avg_exec_time = [self.model_avg_exec_time[model_id] for model_id in ilp_models]
+        
+        # Remap model->engine mapping
+        ilp_model_engine_mapping = {i: [] for i in range(ilp_num_models)}
+        for engine_id, model_ids in self.engine_model_mapping.items():
+            if engine_id not in ilp_engines:
+                continue
+            for model_id in model_ids: 
+                if model_id in ilp_model_mapping:
+                    ilp_model_id = ilp_model_mapping[model_id]
+                    ilp_engine_id = ilp_engine_mapping[engine_id]
+                    ilp_model_engine_mapping[ilp_model_id].append(ilp_engine_id)
+        
+        logger.info(
+            f"ILP problem prepared:\n"
+            f"  Engines: {ilp_num_groups} ({ilp_engines})\n"
+            f"  Models: {ilp_num_models} ({ilp_models})\n"
+            f"  Requests: {len(ilp_reqs_metadata)}\n"
+            f"  GPU pages: {ilp_num_gpu_pages}\n"
+            f"  LoRA capacity: {ilp_lora_capacity}"
+        )
+        
+        return {
+            "ilp_reqs_metadata": ilp_reqs_metadata,
+            "ilp_num_groups": ilp_num_groups,
+            "ilp_num_models": ilp_num_models,
+            "ilp_num_gpu_pages": ilp_num_gpu_pages,
+            "ilp_num_cpu_pages": ilp_num_cpu_pages,
+            "ilp_lora_capacity": ilp_lora_capacity,
+            "ilp_model_avg_exec_time": ilp_model_avg_exec_time,
+            "ilp_model_engine_mapping":  ilp_model_engine_mapping,
+            "ilp_engine_mapping": ilp_engine_mapping,
+            "ilp_model_mapping": ilp_model_mapping,
+            "ilp_engines": ilp_engines,
+            "ilp_models": ilp_models,
+        }
 
 
     async def _perform_migration(self):
         """
-        Perform migration decision and execution. 
-        Based on dLoRA's migration_schedule logic.
+        Perform migration decision and execution.
+        Follows dLoRA's migration_schedule logic exactly.
         
         Steps:
-        1. Fetch current stats from all engines
-        2. Check if migration is needed
-        3. Solve ILP for optimal migration plan
-        4. Execute the migration plan
+        1. Fetch current stats from all engines (get_migration_info)
+        2. Check if migration is needed and select ILP engines
+        3. Prepare ILP problem with remapped indices
+        4. Solve ILP for optimal migration plan
+        5. Execute the migration plan
+        6. Update internal state
         """
         async with self. migration_lock:
             logger.info("=" * 86)
             logger.info("Starting migration cycle...")
             logger.info("=" * 86)
             
-            # Step 1: Fetch current stats from all engines
-            try:
-                await self._fetch_all_engine_stats()
-            except Exception as e:
-                logger.error(f"Failed to fetch engine stats: {e}", exc_info=True)
-                logger.info("=" * 86)
-                return
+            # # Step 1: Fetch current stats (like dLoRA's get_migration_info)
+            # try:
+            #     await self._fetch_all_engine_stats()
+            # except Exception as e:
+            #     logger.error(f"Failed to fetch engine stats: {e}", exc_info=True)
+            #     logger.info("=" * 86)
+            #     return
             
-            # Step 2: Check if migration is needed
-            try:
-                need_migration = self._check_migration_needed()
-            except Exception as e:
-                logger.error(f"Error checking migration criteria: {e}", exc_info=True)
-                logger.info("=" * 86)
-                return
+            # # Step 2: Check if migration is needed and get ILP engines
+            # try:
+            #     need_migration, ilp_engines = self._check_migration_needed()
+            # except Exception as e:
+            #     logger.error(f"Error checking migration criteria: {e}", exc_info=True)
+            #     logger.info("=" * 86)
+            #     return
             
-            if not need_migration:
-                logger.info("✓ No migration needed (system balanced)")
-                logger.info("=" * 86)
-                return
+            # if not need_migration or ilp_engines is None:
+            #     logger.info("✓ No migration needed (system balanced)")
+            #     logger.info("=" * 86)
+            #     return
             
-            logger.info("⚠ Migration needed, running ILP solver...")
+            # logger.info(f"⚠ Migration needed for engines: {ilp_engines}")
+            # logger.info("Preparing ILP problem...")
             
-            # Step 3: Solve ILP for optimal migration plan
-            try:
-                migration_plan = await self._solve_migration_ilp()
-            except Exception as e:
-                logger.error(f"ILP solver error: {e}", exc_info=True)
-                logger.info("=" * 86)
-                return
+            # # Step 3: Prepare ILP problem (like dLoRA's remapping)
+            # try:
+            #     ilp_problem = self._prepare_ilp_problem(ilp_engines)
+            # except Exception as e:
+            #     logger.error(f"Failed to prepare ILP problem:  {e}", exc_info=True)
+            #     logger.info("=" * 86)
+            #     return
             
-            if migration_plan is None:
-                logger.warning("✗ Migration ILP solver failed or returned no plan")
-                logger.info("=" * 86)
-                return
+            # # Step 4: Solve ILP
+            # logger.info("Running ILP solver...")
+            # try:
+            #     migration_plan = await self._solve_migration_ilp(ilp_problem, ilp_engines)
+            # except Exception as e:
+            #     logger.error(f"ILP solver error: {e}", exc_info=True)
+            #     logger.info("=" * 86)
+            #     return
             
-            # Step 4: Execute migration
-            logger.info("Executing migration plan...")
-            try:
-                await self._execute_migration(migration_plan)
-            except Exception as e:
-                logger.error(f"Migration execution failed: {e}", exc_info=True)
-                logger.info("=" * 86)
-                return
+            # if migration_plan is None:
+            #     logger.warning("✗ Migration ILP solver failed or returned no plan")
+            #     logger.info("=" * 86)
+            #     return
+            
+            # # Step 5: Execute migration
+            # logger.info("Executing migration plan...")
+            # try:
+            #     await self._execute_migration(migration_plan, ilp_engines)
+            # except Exception as e:
+            #     logger. error(f"Migration execution failed: {e}", exc_info=True)
+            #     logger.info("=" * 86)
+            #     return
             
             logger.info("✓ Migration cycle complete")
             logger.info("=" * 86)
 
 
-    async def _solve_migration_ilp(self):
+    async def _solve_migration_ilp(
+        self, 
+        ilp_problem: Dict,
+        ilp_engines: List[int]
+    ) -> Optional[Dict]:
         """
-        Solve migration ILP using dLoRA's ILP solver.
+        Solve migration ILP using dLoRA's ILP solver with remapped indices.
         
+        Args:
+            ilp_problem:  Prepared ILP problem from _prepare_ilp_problem
+            ilp_engines: Original engine IDs participating in ILP
+            
         Returns:
-            Dict containing: 
-            - req_migration:  {src_engine:  {dst_engine: [req_ids]}}
-            - lora_weights: {engine_id: [model_ids]}
+            Dict containing:  
+            - req_migration: {src_engine:  {dst_engine: [req_ids]}} (original engine IDs)
+            - lora_weights: {engine_id: [model_ids]} (original IDs)
             - lora_counts: [count per model]
             Or None if solver fails
         """
         try:
-            # Flatten all request metadata
-            all_reqs_metadata = []
-            for engine_id, reqs in self.reqs_metadata.items():
-                all_reqs_metadata.extend(reqs)
+            ilp_reqs_metadata = ilp_problem["ilp_reqs_metadata"]
             
-            if len(all_reqs_metadata) == 0:
-                logger. info("No requests to migrate")
+            if len(ilp_reqs_metadata) == 0:
+                logger.info("No requests to migrate")
                 return None
             
-            logger.info(f"Running ILP solver with {len(all_reqs_metadata)} requests...")
+            logger.info(f"Running ILP solver with {len(ilp_reqs_metadata)} requests...")
             
-            # Create ILP solver
+            # Create ILP solver with remapped problem
+            from sglang.srt.instances.migration_ilp import MigrationILP
+            
             ilp = MigrationILP(
-                reqs_metadata=all_reqs_metadata,
-                num_groups=self.num_instances,
-                num_models=self.num_models,
-                engine_gpu_blocks=self.num_gpu_pages,  # Note: using num_gpu_pages
-                engine_cpu_blocks=[0] * self.num_instances,  # SGLang doesn't use CPU blocks
-                engine_lora_capacity=self.engine_lora_capacity,
-                lora_exec_time=self.model_avg_exec_time,
-                alpha=0.05,  # Migration overhead coefficient (from dLoRA)
-                bw=PCIE_BANDWIDTH / self.cache_page_size,  # Bandwidth in blocks/sec
-                model_engine_mapping=self.model_engine_mapping,
+                reqs_metadata=ilp_reqs_metadata,
+                num_groups=ilp_problem["ilp_num_groups"],
+                num_models=ilp_problem["ilp_num_models"],
+                engine_gpu_blocks=ilp_problem["ilp_num_gpu_pages"],
+                engine_cpu_blocks=ilp_problem["ilp_num_cpu_pages"],
+                engine_lora_capacity=ilp_problem["ilp_lora_capacity"],
+                lora_exec_time=ilp_problem["ilp_model_avg_exec_time"],
+                alpha=0.05,  # Migration overhead coefficient
+                bw=PCIE_BANDWIDTH / self.cache_page_size[0],  # Bandwidth in blocks/sec
+                model_engine_mapping=ilp_problem["ilp_model_engine_mapping"],
             )
             
-            # Solve (this runs in a thread pool to avoid blocking)
+            # Solve (run in thread pool to avoid blocking)
             req_migration_mapping, lora_weight_mapping, lora_weight_cnt = await asyncio.get_event_loop().run_in_executor(
                 None, ilp.solve
             )
@@ -1140,73 +1237,120 @@ class InstanceManager:
                 logger.warning("ILP solver returned no solution")
                 return None
             
+            # # Reverse map back to original engine and model IDs (like dLoRA)
+            # ilp_engines_list = ilp_problem["ilp_engines"]
+            # ilp_models_list = ilp_problem["ilp_models"]
+            
+            # # Reverse map request migrations
+            # original_req_migration = {i: {j: [] for j in range(self.num_instances)} for i in range(self.num_instances)}
+            # for src_ilp_id, dst_mapping in req_migration_mapping.items():
+            #     src_engine_id = ilp_engines_list[src_ilp_id]
+            #     for dst_ilp_id, req_ids in dst_mapping.items():
+            #         dst_engine_id = ilp_engines_list[dst_ilp_id]
+            #         if req_ids:
+            #             logger.debug(f"Move {len(req_ids)} requests from engine {src_engine_id} to {dst_engine_id}")
+            #             original_req_migration[src_engine_id][dst_engine_id] = req_ids
+            
+            # # Reverse map LoRA weights
+            # original_lora_weights = {}
+            # for ilp_engine_id, ilp_model_ids in lora_weight_mapping. items():
+            #     engine_id = ilp_engines_list[ilp_engine_id]
+            #     original_model_ids = [ilp_models_list[mid] for mid in ilp_model_ids]
+            #     original_lora_weights[engine_id] = original_model_ids
+            
+            # # Update global lora weight counts
+            # original_lora_counts = [0] * self.num_models
+            # for engine_id, model_ids in original_lora_weights.items():
+            #     for model_id in model_ids:
+            #         original_lora_counts[model_id] += 1
+            
             # Count total migrations
             total_migrations = sum(
-                len(req_ids) 
-                for dst_mapping in req_migration_mapping.values() 
+                len(req_ids)
+                for dst_mapping in req_migration_mapping.values()
                 for req_ids in dst_mapping.values()
             )
             
-            logger. info(f"ILP solution: {total_migrations} request migrations planned")
-            logger.debug(f"LoRA placement:  {lora_weight_mapping}")
+            logger.info(f"ILP solution:  {total_migrations} request migrations planned")
+            logger.debug(f"LoRA placement: {lora_weight_mapping}")
             
             return {
                 "req_migration":  req_migration_mapping,
                 "lora_weights": lora_weight_mapping,
                 "lora_counts": lora_weight_cnt,
             }
-        except Exception as e:
-            logger. error(f"ILP solver failed: {e}", exc_info=True)
+        
+        except Exception as e: 
+            logger.error(f"ILP solver failed: {e}", exc_info=True)
             return None
 
 
-    async def _execute_migration(self, migration_plan):
+    async def _execute_migration(self, migration_plan: Dict, ilp_engines: List[int]):
         """
         Execute migration plan. 
+        Follows dLoRA's execution order exactly.
         
         Steps:
-        1. Adjust LoRA adapters on all engines
-        2. Migrate requests between engines
-        3. Update internal state
+        1. Execute request migrations (fetch -> insert -> abort)
+        2. Update engine_model_mapping from ILP solution
+        3. Adjust LoRA adapters on all engines
+        4. Run find_best_lora_weight_schedule to refine placement
+        5. Update internal state
         
         Args:
             migration_plan: Dict from _solve_migration_ilp
+            ilp_engines: Original engine IDs that participated in ILP
         """
         req_migration = migration_plan["req_migration"]
         lora_weights = migration_plan["lora_weights"]
+        lora_counts = migration_plan["lora_counts"]
         
-        logger.info(f"Migration plan: LoRA adjustments={lora_weights}")
+        logger.info(f"Migration plan:\n  LoRA adjustments: {lora_weights}\n  Request migrations: {sum(len(reqs) for dsts in req_migration.values() for reqs in dsts. values())} requests")
         
-        # Step 1: Adjust LoRA adapters
-        logger.info("Step 1: Adjusting LoRA adapters...")
+        # Step 1: Update engine_model_mapping from ILP solution (like dLoRA)
+        logger.info("Step 1: Updating LoRA placement from ILP solution...")
+        for engine_id, model_ids in lora_weights.items():
+            self.engine_model_mapping[engine_id] = model_ids
+        
+        # Rebuild model_engine_mapping
+        self.model_engine_mapping = {i: [] for i in range(self.num_models)}
+        for engine_id, model_ids in self.engine_model_mapping.items():
+            for model_id in model_ids: 
+                self.model_engine_mapping[model_id].append(engine_id)
+        
+        logger.info(f"Updated engine_model_mapping: {self. engine_model_mapping}")
+        
+        # Step 2: Refine placement with find_best_lora_weight_schedule (like dLoRA)
+        logger.info("Step 2: Refining LoRA placement...")
         try:
-            await self._execute_lora_adjustment(lora_weights)
+            self.find_best_lora_weight_schedule(
+                is_init=False,
+                expected_lora_distribution=self.expected_lora_distribution,
+                current_lora_distribution=lora_counts,
+                engine_lora_capacity=self.engine_lora_capacity
+            )
         except Exception as e:
-            logger.error(f"LoRA adjustment failed: {e}", exc_info=True)
-            # Continue anyway - request migration might still work
+            logger.error(f"Failed to refine LoRA placement: {e}", exc_info=True)
         
-        # Step 2: Migrate requests
-        logger.info("Step 2: Migrating requests...")
+        # Step 3: Adjust LoRA adapters on engines (like dLoRA)
+        logger.info("Step 3: Syncing LoRA adapters on engines...")
+        try:
+            await self._execute_lora_adjustment(self.engine_model_mapping)
+        except Exception as e: 
+            logger.error(f"LoRA adjustment failed: {e}", exc_info=True)
+            
+        # Step 4: Migrate requests FIRST (like dLoRA)
+        logger.info("Step 4: Migrating requests...")
         try:
             await self._execute_request_migration(req_migration)
         except Exception as e: 
             logger.error(f"Request migration failed: {e}", exc_info=True)
             return
         
-        # Step 3: Update internal state
-        logger. info("Step 3: Updating internal state...")
-        self.engine_model_mapping = lora_weights
-        
-        # Rebuild reverse mapping
-        self.model_engine_mapping = {i: [] for i in range(self.num_models)}
-        for engine_id, model_ids in lora_weights.items():
-            for model_id in model_ids:
-                self.model_engine_mapping[model_id]. append(engine_id)
-        
         logger.info("✓ Migration execution complete")
 
 
-    async def _execute_lora_adjustment(self, lora_weights:  Dict[int, List[int]]):
+    async def _execute_lora_adjustment(self, lora_weights: Dict[int, List[int]]):
         """
         Adjust LoRA adapters on all engines based on migration plan.
         
@@ -1227,27 +1371,26 @@ class InstanceManager:
         success_count = 0
         for engine_id, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Failed to adjust LoRA on engine {engine_id}: {result}")
+                logger. error(f"Failed to adjust LoRA on engine {engine_id}: {result}")
             elif result. get("success", False):
                 success_count += 1
             else:
-                logger.warning(f"LoRA adjustment on engine {engine_id} had errors:  {result. get('errors', [])}")
+                logger.warning(f"LoRA adjustment on engine {engine_id} had errors: {result. get('errors', [])}")
         
-        logger.info(f"LoRA adjustment complete:  {success_count}/{len(lora_weights)} engines successful")
+        logger.info(f"LoRA adjustment complete: {success_count}/{len(lora_weights)} engines successful")
 
 
     async def _execute_request_migration(self, req_migration: Dict[int, Dict[int, List[str]]]):
         """
         Migrate requests between engines.
-        
-        Flow:  Fetch -> Insert -> Abort
+        Follows dLoRA's flow:  Fetch -> Insert -> Abort
         
         Args:
-            req_migration: {src_engine: {dst_engine: [request_ids]}}
+            req_migration: {src_engine:  {dst_engine: [request_ids]}}
         """
         session = await self._get_session()
         
-        # Step 1: Fetch all requests to migrate
+        # Step 1: Fetch all seq_groups to migrate
         fetch_tasks = []
         fetch_info = []
         
@@ -1256,7 +1399,6 @@ class InstanceManager:
                 if len(request_ids) == 0:
                     continue
                 
-                # Validate engine IDs
                 if src_engine_id >= self.num_instances or dst_engine_id >= self.num_instances:
                     logger.warning(f"Invalid engine IDs: src={src_engine_id}, dst={dst_engine_id}")
                     continue
@@ -1266,7 +1408,7 @@ class InstanceManager:
                 fetch_info.append((src_engine_id, dst_engine_id, request_ids))
         
         if not fetch_tasks:
-            logger. info("No requests to migrate")
+            logger.info("No requests to migrate")
             return
         
         logger.info(f"Fetching {len(fetch_tasks)} request groups...")
@@ -1282,7 +1424,7 @@ class InstanceManager:
             
             seq_groups = seq_groups_list[idx]
             if isinstance(seq_groups, Exception):
-                logger.error(f"Failed to fetch seq_groups from engine {src_engine_id}: {seq_groups}")
+                logger.error(f"Failed to fetch seq_groups from engine {src_engine_id}:  {seq_groups}")
                 continue
             
             if not seq_groups:
@@ -1309,7 +1451,7 @@ class InstanceManager:
             
             insert_result = insert_results[idx]
             if isinstance(insert_result, Exception):
-                logger.error(f"Failed to insert to engine {dst_engine_id}:  {insert_result}")
+                logger. error(f"Failed to insert to engine {dst_engine_id}:  {insert_result}")
                 continue
             
             inserted_count = insert_result.get("count", 0)
@@ -1330,14 +1472,9 @@ class InstanceManager:
         session: aiohttp.ClientSession,
         url: str,
         request_ids: List[str]
-    ):
-        """
-        Fetch sequence groups from an engine.
-        
-        Returns:
-            List of seq_group dicts, or None on error
-        """
-        try: 
+    ) -> Optional[List[Dict]]:
+        """Fetch sequence groups from an engine"""
+        try:  
             async with session.post(
                 url, 
                 json={"request_ids": request_ids},
@@ -1348,12 +1485,12 @@ class InstanceManager:
                     logger.error(f"Failed to fetch seq_groups from {url}: status {resp.status}, {error_text}")
                     return None
                 data = await resp.json()
-                return data. get("seq_groups", [])
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching seq_groups from {url}")
+                return data.get("seq_groups", [])
+        except asyncio. TimeoutError:
+            logger. error(f"Timeout fetching seq_groups from {url}")
             return None
         except Exception as e:
-            logger. error(f"Error fetching seq groups from {url}: {e}")
+            logger.error(f"Error fetching seq groups from {url}: {e}")
             return None
 
 
@@ -1362,22 +1499,17 @@ class InstanceManager:
         session: aiohttp.ClientSession,
         url: str,
         seq_groups:  List[Dict]
-    ):
-        """
-        Insert sequence groups to an engine.
-        
-        Returns:
-            Dict with "count" key indicating number of successfully inserted groups
-        """
-        try:
+    ) -> Dict[str, Any]:
+        """Insert sequence groups to an engine"""
+        try: 
             async with session.post(
                 url, 
                 json={"seq_groups": seq_groups},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
-                if resp. status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"Failed to insert seq_groups to {url}: status {resp.status}, {error_text}")
+                if resp.status != 200:
+                    error_text = await resp. text()
+                    logger.error(f"Failed to insert seq_groups to {url}: status {resp. status}, {error_text}")
                     return {"count": 0}
                 return await resp.json()
         except asyncio.TimeoutError:
@@ -1393,9 +1525,9 @@ class InstanceManager:
         session:  aiohttp.ClientSession,
         url: str,
         request_ids: List[str]
-    ):
+    ) -> Optional[Dict]:
         """Abort requests on an engine"""
-        try:
+        try: 
             async with session.post(
                 url, 
                 json={"request_ids": request_ids},
@@ -1405,9 +1537,9 @@ class InstanceManager:
                     error_text = await resp.text()
                     logger. warning(f"Failed to abort requests at {url}: status {resp.status}, {error_text}")
                     return None
-                return await resp.json()
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout aborting requests at {url}")
+                return await resp. json()
+        except asyncio. TimeoutError:
+            logger. error(f"Timeout aborting requests at {url}")
             return None
         except Exception as e: 
             logger.error(f"Error aborting requests at {url}: {e}")
