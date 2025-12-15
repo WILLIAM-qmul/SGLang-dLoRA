@@ -16,6 +16,7 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from sglang.srt.instances.lora_config_paths import LORA_PATH, NUM_LORAS
 from sglang.srt.instances.instance_manager import InstanceManager, MigrationType
 
 
@@ -25,17 +26,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
-
-# LoRA paths configuration
-NUM_LORAS = 4
-LORA_PATH = {
-    "base": "/workspace/models/Llama-2-7b-hf",
-    "lora0": "/workspace/models/llama-2-7b-chat-lora-adaptor",
-    "lora1": "/workspace/models/llama-2-7b-LORA-data-analyst",
-    "lora2": "/workspace/models/llama2-stable-7b-lora",
-    "lora3": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
-}
 
 
 app = FastAPI()

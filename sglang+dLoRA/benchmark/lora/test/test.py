@@ -16,23 +16,16 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from sglang.srt.instances.lora_config_paths import LORA_PATH, NUM_LORAS
 from sglang.srt.instances.instance_manager import InstanceManager, MigrationType
-# from sglang.srt.instances.engine_manager import EngineManager, MigrationType
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger(__name__)
-
-
-# LoRA paths configuration
-NUM_LORAS = 4
-LORA_PATH = {
-    "base": "/workspace/models/Llama-2-7b-hf",
-    "lora0": "/workspace/models/llama-2-7b-chat-lora-adaptor",
-    "lora1": "/workspace/models/llama-2-7b-LORA-data-analyst",
-    "lora2": "/workspace/models/llama2-stable-7b-lora",
-    "lora3": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
-}
 
 
 app = FastAPI()
@@ -127,7 +120,8 @@ async def generate(request: Request):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
     
     # Select instance using manager
-    instance_id, instance_url = await manager.select_engine(request_id, model_id)
+    engine_id = await manager.select_engine(request_id, model_id)
+    instance_url = manager.instance_urls[engine_id]
     
     # Forward request
     target_url = f"{instance_url}/generate"
@@ -154,8 +148,8 @@ async def generate(request: Request):
         except Exception as e:
             error_msg = {"error": str(e)}
             yield (json.dumps(error_msg) + "\n").encode("utf-8")
-        finally:
-            await manager.complete_request(request_id)
+        # finally:
+            # await manager.complete_request(request_id)
     
     return StreamingResponse(
         stream_from_backend(),

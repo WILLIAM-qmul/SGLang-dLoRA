@@ -433,6 +433,7 @@ class InstanceManager:
             "success": True,
         }
         
+        # NOTE: There are two strategies:  sequential or parallel load/unload.
         # # Unload adapters first to free up capacity
         # for lora_name in to_unload:
         #     try:
@@ -1125,60 +1126,60 @@ class InstanceManager:
             logger.info("Starting migration cycle...")
             logger.info("=" * 86)
             
-            # # Step 1: Fetch current stats (like dLoRA's get_migration_info)
-            # try:
-            #     await self._fetch_all_engine_stats()
-            # except Exception as e:
-            #     logger.error(f"Failed to fetch engine stats: {e}", exc_info=True)
-            #     logger.info("=" * 86)
-            #     return
+            # Step 1: Fetch current stats (like dLoRA's get_migration_info)
+            try:
+                await self._fetch_all_engine_stats()
+            except Exception as e:
+                logger.error(f"Failed to fetch engine stats: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
-            # # Step 2: Check if migration is needed and get ILP engines
-            # try:
-            #     need_migration, ilp_engines = self._check_migration_needed()
-            # except Exception as e:
-            #     logger.error(f"Error checking migration criteria: {e}", exc_info=True)
-            #     logger.info("=" * 86)
-            #     return
+            # Step 2: Check if migration is needed and get ILP engines
+            try:
+                need_migration, ilp_engines = self._check_migration_needed()
+            except Exception as e:
+                logger.error(f"Error checking migration criteria: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
-            # if not need_migration or ilp_engines is None:
-            #     logger.info("✓ No migration needed (system balanced)")
-            #     logger.info("=" * 86)
-            #     return
+            if not need_migration or ilp_engines is None:
+                logger.info("✓ No migration needed (system balanced)")
+                logger.info("=" * 86)
+                return
             
-            # logger.info(f"⚠ Migration needed for engines: {ilp_engines}")
-            # logger.info("Preparing ILP problem...")
+            logger.info(f"⚠ Migration needed for engines: {ilp_engines}")
+            logger.info("Preparing ILP problem...")
             
-            # # Step 3: Prepare ILP problem (like dLoRA's remapping)
-            # try:
-            #     ilp_problem = self._prepare_ilp_problem(ilp_engines)
-            # except Exception as e:
-            #     logger.error(f"Failed to prepare ILP problem:  {e}", exc_info=True)
-            #     logger.info("=" * 86)
-            #     return
+            # Step 3: Prepare ILP problem (like dLoRA's remapping)
+            try:
+                ilp_problem = self._prepare_ilp_problem(ilp_engines)
+            except Exception as e:
+                logger.error(f"Failed to prepare ILP problem:  {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
-            # # Step 4: Solve ILP
-            # logger.info("Running ILP solver...")
-            # try:
-            #     migration_plan = await self._solve_migration_ilp(ilp_problem, ilp_engines)
-            # except Exception as e:
-            #     logger.error(f"ILP solver error: {e}", exc_info=True)
-            #     logger.info("=" * 86)
-            #     return
+            # Step 4: Solve ILP
+            logger.info("Running ILP solver...")
+            try:
+                migration_plan = await self._solve_migration_ilp(ilp_problem, ilp_engines)
+            except Exception as e:
+                logger.error(f"ILP solver error: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
-            # if migration_plan is None:
-            #     logger.warning("✗ Migration ILP solver failed or returned no plan")
-            #     logger.info("=" * 86)
-            #     return
+            if migration_plan is None:
+                logger.warning("✗ Migration ILP solver failed or returned no plan")
+                logger.info("=" * 86)
+                return
             
-            # # Step 5: Execute migration
-            # logger.info("Executing migration plan...")
-            # try:
-            #     await self._execute_migration(migration_plan, ilp_engines)
-            # except Exception as e:
-            #     logger. error(f"Migration execution failed: {e}", exc_info=True)
-            #     logger.info("=" * 86)
-            #     return
+            # Step 5: Execute migration
+            logger.info("Executing migration plan...")
+            try:
+                await self._execute_migration(migration_plan, ilp_engines)
+            except Exception as e:
+                logger. error(f"Migration execution failed: {e}", exc_info=True)
+                logger.info("=" * 86)
+                return
             
             logger.info("✓ Migration cycle complete")
             logger.info("=" * 86)
