@@ -3,19 +3,18 @@
 
 import argparse
 import asyncio
+import aiohttp
 import json
 import random
 import resource
 import sys
 import time
 import traceback
+import numpy as np
 from argparse import ArgumentParser
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
 from collections import defaultdict
-
-import aiohttp
-import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -36,7 +35,6 @@ from sglang.bench_serving import (
 
 from sglang.srt.workload_generator.trace import Trace
 from sglang.srt.instances.lora_config_paths import LORA_PATH, NUM_LORAS
-from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
 
 global args
 
@@ -92,25 +90,38 @@ async def async_request_openai_completions(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ").strip()
                         latency = time.perf_counter() - st
-                        
+
                         if chunk == "[DONE]":
-                            pass
-                        else:
+                            continue
+
+                        try:
                             data = json.loads(chunk)
+                        except Exception:
+                            # Ignore non-JSON SSE events
+                            continue
 
-                            if data["text"]:
-                                timestamp = time.perf_counter()
-                                
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                        # unified server / backend error events
+                        if isinstance(data, dict) and "error" in data:
+                            output.error = str(data.get("error"))
+                            output.success = False
+                            break
 
-                                most_recent_timestamp = timestamp
-                                generated_text += data["text"]
+                        text_piece = ""
+                        if isinstance(data, dict):
+                            text_piece = data.get("text") or ""
+
+                        if text_piece:
+                            timestamp = time.perf_counter()
+                            if ttft == 0.0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+
+                            most_recent_timestamp = timestamp
+                            generated_text += text_piece
 
                     output.generated_text = generated_text
                     output.success = True
@@ -134,29 +145,6 @@ ASYNC_REQUEST_FUNCS = {
 }
 
 
-async def monitor_utilization(
-    cpu_utils: List[float], gpu_utils: List[float], stop_event: asyncio.Event
-):
-    """Monitors CPU and GPU utilization periodically."""
-    while not stop_event.is_set():
-        cpu_utils.append(psutil.cpu_percent())
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                avg_gpu_util = sum(gpu.load for gpu in gpus) / len(gpus)
-                gpu_utils.append(avg_gpu_util * 100)  # GPUtil.load is a fraction
-            else:
-                gpu_utils.append(0)
-        except Exception:
-            gpu_utils.append(0)
-
-        try:
-            # Wait for 1 second or until the stop event is set
-            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
-            pass  # This is expected, continue the loop
-
-
 async def benchmark(
     backend: str,
     api_url: str,
@@ -172,7 +160,6 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # 🔥 关键修改: 确定路由方式
     use_unified_server = args.inference_architecture == "dlora"
     
     if use_unified_server:
@@ -182,7 +169,6 @@ async def benchmark(
         print(f"  - Routing Strategy: Least-Loaded (实时动态负载均衡)")
         print(f"  - Mode: {'Trace Replay' if args.use_trace else 'Poisson Arrival'}")
         
-        # 后端实例 URL (仅用于统计)
         backend_instance_urls = [
             f"http://{args.host}:{args.sglang_port + i}"
             for i in range(args.num_instances)
@@ -257,12 +243,30 @@ async def benchmark(
     else:
         print("Initial test run completed. Starting main benchmark run...")
         
-    # 启动利用率监控
-    cpu_utils, gpu_utils = [], []
-    stop_monitor_event = asyncio.Event()
-    monitor_task = asyncio.create_task(
-        monitor_utilization(cpu_utils, gpu_utils, stop_monitor_event)
-    )
+    
+    # 通知服务器 benchmark 开始
+    server_url = args.unified_server_url if args.inference_architecture == "dlora" else f"http://{args.host}:{args.port}"
+    bench_info = {
+        "backend": backend,
+        "architecture": args.inference_architecture,
+        "num_prompts": len(input_requests),
+        "request_rate": request_rate,
+        "use_trace": args.use_trace,
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{server_url}/start_benchmark",
+                json={"info": json.dumps(bench_info)}
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    print(f"\n✅ Server notified:  {result. get('message')}")
+                else:
+                    print(f"\n⚠️  Failed to notify server (start): {resp.status}")
+    except Exception as e:
+        print(f"\n⚠️  Failed to notify server (start): {e}")
 
     # 主 benchmark 循环
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
@@ -271,7 +275,7 @@ async def benchmark(
     request_idx = 0
 
     if args.use_trace:
-        # 🔥 Trace 回放模式 - 支持动态路由
+        # Trace 回放模式 - 支持动态路由
         workload = Trace(
             trace_name=args.trace_name,
             trace_dir=args.trace_path,
@@ -293,7 +297,7 @@ async def benchmark(
         async for model_id, request in request_generator:
             lora_path = "dummy" if args.base_only else f"lora{model_id}"
             
-            # 🔥 关键: 根据架构选择路由方式
+            # 关键: 根据架构选择路由方式
             if use_unified_server:
                 # dLoRA: 所有请求都通过 Unified Server (实时负载均衡)
                 target_api_url = f"{unified_server_url}/generate"
@@ -315,7 +319,7 @@ async def benchmark(
             request_idx += 1
     
     else:
-        # 🔥 非 trace 模式 (Poisson 到达)
+        # 非 trace 模式 (Poisson 到达)
         prompts_per_lora = max(1, len(input_requests) // NUM_LORAS)
         
         async for request in get_request(input_requests, request_rate):
@@ -331,7 +335,7 @@ async def benchmark(
                     lora_id = 0
                 lora_path = f"lora{lora_id}"
 
-            # 🔥 关键: 根据架构选择路由方式
+            # 关键: 根据架构选择路由方式
             if use_unified_server:
                 # dLoRA: 所有请求都通过 Unified Server (实时负载均衡)
                 target_api_url = f"{unified_server_url}/generate"
@@ -357,11 +361,20 @@ async def benchmark(
     if pbar:
         pbar.close()
         
-    # 停止监控并计算平均值
-    stop_monitor_event.set()
-    await monitor_task
-    avg_cpu_util = np.mean(cpu_utils) if cpu_utils else 0
-    avg_gpu_util = np.mean(gpu_utils) if gpu_utils else 0
+    # 新增: 通知服务器 benchmark 结束
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{server_url}/end_benchmark",
+                json={"info": json.dumps(bench_info)}
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    print(f"\n✅ Server notified: {result.get('message')}")
+                else: 
+                    print(f"\n⚠️  Failed to notify server (end): {resp.status}")
+    except Exception as e: 
+        print(f"\n⚠️  Failed to notify server (end): {e}")
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
@@ -372,7 +385,6 @@ async def benchmark(
         backend=backend,
     )
 
-    # 打印结果
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Architecture:", args.inference_architecture))
@@ -388,12 +400,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{s:{c}^{n}}".format(s="Resource Utilization", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Avg CPU Utilization (%):", avg_cpu_util))
-    print("{:<40} {:<10.2f}".format("Avg GPU Utilization (%):", avg_gpu_util))
     print("=" * 50)
 
-    # 保存结果
     result = {
         "backend": args.backend,
         "architecture": args.inference_architecture,
@@ -409,19 +417,15 @@ async def benchmark(
         "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
         "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
         "median_ttft_ms": metrics.median_ttft_ms,
-        "avg_cpu_utilization": avg_cpu_util,
-        "avg_gpu_utilization": avg_gpu_util,
     }
-
-    # 确定输出文件名
+    
     if args.output_file:
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
         trace_suffix = "_trace" if args.use_trace else ""
-        output_file_name = f"{args.backend}_{args.inference_architecture}{trace_suffix}_{now}_{args.num_prompts}.jsonl"
+        output_file_name = f"{args.backend}_{args.inference_architecture}{trace_suffix}_{args.trace_name}_{args.trace_total_rate}_{args.trace_map_stride}_{args.num_prompts}.jsonl"
 
-    # 追加结果到 JSONL 文件
     with open(output_file_name, "a") as file:
         file.write(json.dumps(result) + "\n")
 

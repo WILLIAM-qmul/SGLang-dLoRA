@@ -1,4 +1,5 @@
 # File: benchmark/lora/migration/launch_dlora_server.py
+# File: benchmark/lora/migration/launch_dlora_server. py
 """
 Launch Unified Server with EngineManager for dynamic load balancing. 
 Fully adapted from dLoRA to SGLang architecture. 
@@ -6,7 +7,7 @@ Fully adapted from dLoRA to SGLang architecture.
 Fixes:
 1) Robust SSE forwarding:  do NOT use resp.content.iter_any(), which can break SSE framing
    and cause client benchmark to treat requests as failed/unfinished.
-2) Always emit valid SSE messages to the client, including termination "data:  [DONE]\\n\\n". 
+2) Always emit valid SSE messages to the client, including termination "data: [DONE]\\n\\n". 
 3) Make completion bookkeeping robust against client disconnects/cancellation.
 4) Optional unified logging to a single file, including SGLang instance subprocess stdout/stderr.
 5) CPU and GPU utilization monitoring with benchmark phase tracking.
@@ -22,20 +23,20 @@ import uvicorn
 import json
 import os
 import uuid
-import threading
 from typing import Any, AsyncIterator, Dict, Optional, Set, Tuple, List
 from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from sglang.srt.instances. lora_config_paths import LORA_PATH, NUM_LORAS
-from sglang.srt.instances. instance_manager import InstanceManager, MigrationType
+from sglang.srt. instances. lora_config_paths import LORA_PATH, NUM_LORAS
+from sglang.srt.instances.instance_manager import InstanceManager, MigrationType
 
 import psutil
 import GPUtil
 
 
+# logger = logging.getLogger("launch_dlora_server")
 logger = logging.getLogger(__name__)
 
 def setup_logging(log_file: Optional[str] = None, level: str = "INFO") -> None:
@@ -64,193 +65,22 @@ def setup_logging(log_file: Optional[str] = None, level: str = "INFO") -> None:
         root.addHandler(fh)
 
 
-class ResourceMonitor: 
-    """
-    Resource Monitor for CPU/GPU utilization tracking during benchmarks.
-    """
-    
-    def __init__(self, output_file: Optional[str] = None):
-        self.monitoring_data: List[Dict[str, Any]] = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
-        
-        self.manual_phase = "warmup"
-        self.benchmark_count = 0
-        
-        if output_file:
-            self.output_file = output_file
-        else: 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.output_file = f"monitoring_dlora_{timestamp}.jsonl"
-    
-    def _collect_data(self) -> Dict[str, Any]: 
-        """
-        Collect a single data point of resource usage.
-        """
-        timestamp = datetime.now().isoformat()
-        
-        # CPU's overall utilization
-        cpu_util = psutil.cpu_percent(interval=None)
-
-        # CPU's memory usage
-        vmem = psutil.virtual_memory()
-        cpu_memory_used_mb = vmem.used / 1024 / 1024
-        cpu_memory_total_mb = vmem.total / 1024 / 1024
-        cpu_memory_util = vmem.percent
-
-        # GPU's overall utilization
-        gpu_utils = {}
-        try:
-            gpus = GPUtil. getGPUs()
-            for gpu in gpus:
-                gpu_data = {
-                    "utilization": gpu.load * 100,
-                    "memory_used_mb": gpu.memoryUsed,
-                    "memory_total_mb": gpu.memoryTotal,
-                    "memory_util": gpu.memoryUtil * 100,
-                    "temperature": gpu.temperature,
-                }
-                gpu_utils[f"gpu_{gpu.id}"] = gpu_data
-        except Exception as e:
-            logger.warning(f"[Monitor] 获取GPU信息失败: {e}")
-        
-        data_point = {
-            "timestamp": timestamp,
-            "phase": self.manual_phase,
-            "benchmark_count": self. benchmark_count,
-            "cpu_utilization": cpu_util,
-            "cpu_memory_used_mb": cpu_memory_used_mb,
-            "cpu_memory_total_mb": cpu_memory_total_mb,
-            "cpu_memory_util": cpu_memory_util,
-            "gpus": gpu_utils,
-        }
-        
-        return data_point
-    
-    def _monitoring_loop(self):
-        """
-        Monitoring loop running in a separate thread.
-        """
-        logger.info("[Monitor] 开始资源监控循环...")
-        
-        while not self.stop_event.is_set():
-            try:
-                data_point = self._collect_data()
-                
-                with self.lock:
-                    self.monitoring_data.append(data_point)
-                
-                self.stop_event.wait(1.0)
-                
-            except Exception as e:
-                logger. error(f"[Monitor] 监控循环错误:  {e}")
-                time.sleep(1.0)
-        
-        logger.info("[Monitor] 监控循环结束")
-    
-    def start_monitoring(self):
-        """启动监控 (线程模式)"""
-        if self.thread and self.thread.is_alive():
-            logger.warning("[Monitor] 监控已在运行")
-            return
-        
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._monitoring_loop, daemon=True)
-        self.thread.start()
-        logger.info(f"[Monitor] 监控已启动，输出文件: {self.output_file}")
-    
-    def stop_monitoring(self):
-        """
-        Stop monitoring and save data.
-        """
-        if self.thread and self.thread.is_alive():
-            logger.info("[Monitor] 停止监控...")
-            self.stop_event.set()
-            self.thread.join(timeout=5.0)
-            if self.thread.is_alive():
-                logger.warning("[Monitor] 监控线程未能正常结束")
-        
-        self. save_data()
-    
-    def set_manual_phase(self, phase: str):
-        """
-        Set the current manual phase.
-        """
-        with self.lock:
-            old_phase = self. manual_phase
-            self.manual_phase = phase
-            if old_phase != phase:
-                logger.info(f"[Monitor] 阶段变更:  {old_phase} -> {phase}")
-    
-    def increment_benchmark(self):
-        """
-        Increment benchmark count.
-        """
-        with self.lock:
-            self.benchmark_count += 1
-            logger.info(f"[Monitor] 📊 Benchmark #{self.benchmark_count} 开始")
-    
-    def save_data(self):
-        """
-        Save collected monitoring data to output file.
-        """
-        try:
-            with self.lock:
-                data_to_save = self.monitoring_data.copy()
-            
-            if not data_to_save: 
-                logger.info("[Monitor] 无数据需要保存")
-                return
-            
-            os.makedirs(os.path.dirname(self.output_file) or ".", exist_ok=True)
-            
-            with open(self.output_file, "w") as f:
-                for data_point in data_to_save:
-                    f.write(json.dumps(data_point) + "\n")
-            
-            logger.info(f"[Monitor] 已保存 {len(data_to_save)} 个数据点到 {self.output_file}")
-            
-            phase_counts = {}
-            for dp in data_to_save:
-                phase = dp.get("phase", "unknown")
-                phase_counts[phase] = phase_counts. get(phase, 0) + 1
-            
-            logger.info(f"[Monitor] 各阶段数据点:  {phase_counts}")
-            
-        except Exception as e: 
-            logger.error(f"[Monitor] 保存数据失败: {e}")
-    
-    def get_status(self) -> Dict[str, Any]: 
-        """
-        Get current monitoring status.
-        """
-        with self.lock:
-            data_count = len(self. monitoring_data)
-            current_phase = self.manual_phase
-            
-        is_running = self. thread and self.thread.is_alive()
-        
-        return {
-            "monitoring_active": is_running,
-            "current_phase": current_phase,
-            "benchmark_count": self.benchmark_count,
-            "data_points_collected": data_count,
-            "output_file": self. output_file,
-        }
-
-
 app = FastAPI()
-manager:  InstanceManager = None
+manager: InstanceManager = None
 client_session: Optional[aiohttp.ClientSession] = None
 request_migration_map: Dict[str, int] = {}
 migration_map_lock = asyncio.Lock()
 
-# Global resource monitor
-monitor:  Optional[ResourceMonitor] = None
+monitoring_data: List[Dict[str, Any]] = []
+monitoring_lock = asyncio.Lock()
+monitoring_task: Optional[asyncio.Task] = None
+stop_monitoring_event = asyncio.Event()
+current_phase = "warmup"  # warmup, benchmarking, idle
+benchmark_count = 0
+monitoring_output_file: Optional[str] = None
 
 
-def build_sglang_cmd(args, port:  int, gpu_id: int) -> str:
+def build_sglang_cmd(args, port: int, gpu_id: int) -> str:
     """Build SGLang server launch command."""
     base_path = LORA_PATH["base"]
     
@@ -263,7 +93,7 @@ def build_sglang_cmd(args, port:  int, gpu_id: int) -> str:
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
     cmd += f"--max-running-requests {args.max_running_requests} "
     cmd += f"--lora-backend {args.lora_backend} "
-    cmd += f"--tp-size {args. tp_size} "
+    cmd += f"--tp-size {args.tp_size} "
     cmd += f"--host {args.host} --port {port} "
     
     if args.disable_custom_all_reduce:
@@ -271,11 +101,11 @@ def build_sglang_cmd(args, port:  int, gpu_id: int) -> str:
     if args.enable_mscclpp:
         cmd += "--enable-mscclpp "
     
-    return cmd. strip()
+    return cmd.strip()
 
 
 def launch_sglang_instances(
-    args:  argparse.Namespace, log_file: Optional[str]
+    args: argparse.Namespace, log_file: Optional[str]
 ) -> Tuple[list, list]:
     """Launch multiple SGLang server instances."""
     procs = []
@@ -289,12 +119,8 @@ def launch_sglang_instances(
     logger.info(f"Starting port: {args.sglang_port}")
     logger.info("=" * 86)
 
-    global monitor
-    if monitor:
-        monitor.set_manual_phase("launching_instances")
-
-    # If a unified log file is provided, append all instance stdout/stderr to it. 
-    # NOTE: This mixes logs, but satisfies "all in one file" requirement. 
+    # If a unified log file is provided, append all instance stdout/stderr to it.
+    # NOTE: This mixes logs, but satisfies "all in one file" requirement.
     log_fh = None
     if log_file:
         os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
@@ -305,8 +131,8 @@ def launch_sglang_instances(
         gpu_id = i
         cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} " + build_sglang_cmd(args, port, gpu_id)
 
-        logger.info(f"\n[Instance {i}] 在 GPU {gpu_id} 上启动，端口 {port}")
-        logger.info(f"  命令: {cmd}")
+        logger.info(f"\n[Instance {i}] Launching on GPU {gpu_id}, Port {port}")
+        logger.info(f"  Command: {cmd}")
 
         if log_fh is not None:
             proc = subprocess.Popen(
@@ -326,56 +152,53 @@ def launch_sglang_instances(
         time.sleep(3)
 
     logger.info("\n" + "=" * 86)
-    logger.info("✓ 所有 SGLang 实例已启动!")
+    logger.info("✓ All SGLang Instances Launched!")
     logger.info("=" * 86)
-    logger.info("\n实例 URLs:")
+    logger.info("\nInstance URLs:")
     for i, url in enumerate(instance_urls):
-        logger.info(f"  实例 {i}:  {url}")
+        logger.info(f"  Instance {i}: {url}")
     logger.info("=" * 86)
-
-    if monitor:
-        monitor.set_manual_phase("idle")
 
     return procs, instance_urls
 
 
 def _ensure_sse_bytes(data: str) -> bytes:
-    """Wrap a payload as an SSE 'data: ' event."""
+    """Wrap a payload as an SSE 'data:' event."""
     if not data.endswith("\n\n"):
         if data.endswith("\n"):
             data = data + "\n"
-        else: 
+        else:
             data = data + "\n\n"
     # Ensure it has "data:" prefix for SSE compatibility with OpenAI-style stream consumers
     if not data.startswith("data:"):
-        data = "data:  " + data
+        data = "data: " + data
         if not data.endswith("\n\n"):
             data += "\n\n"
-    return data. encode("utf-8")
+    return data.encode("utf-8")
 
 def _sse_done() -> bytes:
-    return b"data:  [DONE]\n\n"
+    return b"data: [DONE]\n\n"
 
 def _split_sse_events(buf: bytearray) -> list[bytes]:
     """Split SSE events by blank line (\\n\\n), preserving event bytes."""
-    out:  list[bytes] = []
+    out: list[bytes] = []
     sep = b"\n\n"
     while True:
         i = buf.find(sep)
         if i < 0:
             break
-        out. append(bytes(buf[: i + 2]))
-        del buf[:  i + 2]
+        out.append(bytes(buf[: i + 2]))
+        del buf[: i + 2]
     return out
 
 def _extract_sse_data(event: bytes) -> Optional[str]:
-    """Extract concatenated data:  lines from an SSE event, without 'data:' prefix."""
+    """Extract concatenated data: lines from an SSE event, without 'data:' prefix."""
     text = event.decode("utf-8", errors="replace")
     data_lines = []
     for line in text.splitlines():
         if line.startswith("data:"):
-            data_lines.append(line[len("data: ") :]. lstrip())
-    if not data_lines: 
+            data_lines.append(line[len("data:") :].lstrip())
+    if not data_lines:
         return None
     return "\n".join(data_lines)
 
@@ -384,105 +207,186 @@ async def _stream_backend_sse_events(
     session: aiohttp.ClientSession,
     url: str,
     payload: Dict[str, Any],
-) -> AsyncIterator[bytes]: 
+) -> AsyncIterator[bytes]:
     """
     POST to backend /generate and yield complete SSE event frames (bytes ending with \\n\\n).
     """
     async with session.post(url, json=payload) as resp:
         if resp.status != 200:
             body = await resp.text()
-            raise RuntimeError(f"backend status={resp.status}, body={body[: 500]}")
+            raise RuntimeError(f"backend status={resp.status}, body={body[:500]}")
         buf = bytearray()
-        async for chunk in resp.content. iter_any():
+        async for chunk in resp.content.iter_any():
             if not chunk:
                 continue
             buf.extend(chunk)
             for ev in _split_sse_events(buf):
                 yield ev
         # flush tail if any
-        if buf. strip():
+        if buf.strip():
             tail = bytes(buf)
             if not tail.endswith(b"\n\n"):
                 tail += b"\n\n"
             yield tail
 
 
+async def monitor_utilization_loop():
+    """持续监控 CPU 和每个 GPU 的使用率"""
+    global monitoring_data, current_phase
+    
+    logger.info("[Monitor] Starting utilization monitoring loop...")
+    
+    while not stop_monitoring_event. is_set():
+        try:
+            timestamp = datetime.now().isoformat()
+            
+            # CPU 使用率
+            cpu_util = psutil.cpu_percent(interval=None)
+            
+            # 每个 GPU 的使用率
+            gpu_utils = {}
+            try:
+                gpus = GPUtil.getGPUs()
+                for gpu in gpus:
+                    gpu_utils[f"gpu_{gpu.id}"] = {
+                        "utilization": gpu.load * 100,  # 转换为百分比
+                        "memory_used_mb": gpu.memoryUsed,
+                        "memory_total_mb": gpu.memoryTotal,
+                        "memory_util": gpu.memoryUtil * 100,
+                        "temperature": gpu.temperature,
+                    }
+            except Exception as e: 
+                logger.warning(f"[Monitor] Failed to get GPU info: {e}")
+            
+            # 记录数据
+            data_point = {
+                "timestamp": timestamp,
+                "phase": current_phase,
+                "benchmark_count": benchmark_count,
+                "cpu_utilization": cpu_util,
+                "gpus": gpu_utils,
+            }
+            
+            async with monitoring_lock:
+                monitoring_data.append(data_point)
+            
+            # 每秒采样一次
+            try:
+                await asyncio.wait_for(stop_monitoring_event.wait(), timeout=1.0)
+            except asyncio. TimeoutError:
+                pass
+                
+        except Exception as e: 
+            logger.error(f"[Monitor] Error in monitoring loop: {e}")
+            await asyncio. sleep(1.0)
+    
+    logger.info("[Monitor] Monitoring loop stopped")
+
+
+def save_monitoring_data():
+    """保存监控数据到文件"""
+    global monitoring_data, monitoring_output_file
+    
+    if not monitoring_output_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        monitoring_output_file = f"monitoring_dlora_{timestamp}.jsonl"
+    
+    try: 
+        with open(monitoring_output_file, "w") as f:
+            for data_point in monitoring_data: 
+                f.write(json.dumps(data_point) + "\n")
+        
+        logger.info(f"[Monitor] Saved {len(monitoring_data)} data points to {monitoring_output_file}")
+        
+        # 打印统计摘要
+        phases = {}
+        for dp in monitoring_data:
+            phase = dp["phase"]
+            if phase not in phases:
+                phases[phase] = 0
+            phases[phase] += 1
+        
+        logger.info(f"[Monitor] Data points by phase: {phases}")
+        
+    except Exception as e:
+        logger.error(f"[Monitor] Failed to save monitoring data: {e}")
+
+
 @app.post("/start_benchmark")
 async def start_benchmark(request: Request):
-    """
-    Notify server that a new benchmark is starting.
-    """
-    global monitor
+    """通知服务器 benchmark 开始"""
+    global current_phase, benchmark_count
     
     try:
         data = await request.json()
         bench_info = data.get("info", "")
         
-        if monitor:
-            monitor. increment_benchmark()
-            monitor.set_manual_phase("benchmarking")
+        async with monitoring_lock:
+            benchmark_count += 1
+            current_phase = "benchmarking"
         
         logger.info("=" * 80)
-        logger.info(f"[Monitor] 📊 BENCHMARK #{monitor.benchmark_count} STARTED")
+        logger.info(f"[Monitor] 📊 BENCHMARK #{benchmark_count} STARTED")
         logger.info(f"[Monitor] Info: {bench_info}")
         logger.info("=" * 80)
         
         return JSONResponse({
-            "status":  "ok",
-            "benchmark_count": monitor. benchmark_count if monitor else 0,
-            "message": f"Benchmark #{monitor.benchmark_count if monitor else 0} started"
+            "status": "ok",
+            "benchmark_count": benchmark_count,
+            "message": f"Benchmark #{benchmark_count} started"
         })
         
     except Exception as e:
-        logger.error(f"[API] start_benchmark 错误: {e}")
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        logger. error(f"[Monitor] Error in start_benchmark: {e}")
+        return JSONResponse({"status": "error", "message":  str(e)}, status_code=500)
 
 
 @app.post("/end_benchmark")
 async def end_benchmark(request: Request):
-    """
-    Notify server that a benchmark has ended.
-    """
-    global monitor
+    """通知服务器 benchmark 结束"""
+    global current_phase, benchmark_count
     
     try:
-        data = await request. json()
-        bench_info = data. get("info", "")
+        data = await request.json()
+        bench_info = data.get("info", "")
         
-        if monitor:
-            monitor.set_manual_phase("idle")
-            # 保存当前数据
-            monitor. save_data()
+        async with monitoring_lock:
+            current_phase = "idle"
         
         logger.info("=" * 80)
-        logger.info(f"[Monitor] ✅ BENCHMARK #{monitor.benchmark_count if monitor else 0} COMPLETED")
+        logger.info(f"[Monitor] ✅ BENCHMARK #{benchmark_count} COMPLETED")
         logger.info(f"[Monitor] Info: {bench_info}")
-        logger.info(f"[Monitor] 切换到 IDLE 阶段")
+        logger.info(f"[Monitor] Switching to IDLE phase")
         logger.info("=" * 80)
+        
+        # 保存当前数据（追加模式）
+        save_monitoring_data()
         
         return JSONResponse({
-            "status":  "ok",
-            "benchmark_count":  monitor.benchmark_count if monitor else 0,
-            "message": f"Benchmark #{monitor.benchmark_count if monitor else 0} completed"
+            "status": "ok",
+            "benchmark_count": benchmark_count,
+            "message": f"Benchmark #{benchmark_count} completed"
         })
         
     except Exception as e:
-        logger. error(f"[API] end_benchmark 错误: {e}")
+        logger. error(f"[Monitor] Error in end_benchmark: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 @app.get("/monitoring_status")
 async def get_monitoring_status():
-    """
-    Get current resource monitoring status.
-    """
-    global monitor
+    """获取当前监控状态"""
+    global current_phase, benchmark_count, monitoring_data
     
-    if not monitor: 
-        return JSONResponse({"error": "监控器未初始化"}, status_code=500)
+    async with monitoring_lock:
+        data_count = len(monitoring_data)
     
-    return JSONResponse(monitor.get_status())
-
+    return JSONResponse({
+        "current_phase": current_phase,
+        "benchmark_count": benchmark_count,
+        "data_points_collected": data_count,
+        "monitoring_file": monitoring_output_file,
+    })
 
 @app.post("/notify_migration")
 async def notify_migration(request: Request):
@@ -490,8 +394,8 @@ async def notify_migration(request: Request):
     Receive migration notifications from InstanceManager
     Body: {
         "migrations": [
-            {"request_id": "req_xxx", "old_engine": 0, "new_engine": 1},
-            ...  
+            {"request_id": "req_xxx", "old_engine":  0, "new_engine": 1},
+            ... 
         ]
     }
     """
@@ -499,36 +403,36 @@ async def notify_migration(request: Request):
         data = await request.json()
         migrations = data.get("migrations", [])
         
-        async with migration_map_lock:  
-            for mig in migrations: 
+        async with migration_map_lock: 
+            for mig in migrations:
                 rid = mig["request_id"]
                 new_engine = mig["new_engine"]
                 request_migration_map[rid] = new_engine
-                logger.info(f"[Migration] Notified: {rid} -> Engine {new_engine}")
+                logger.info(f"[Migration] Notified:  {rid} -> Engine {new_engine}")
         
         return JSONResponse({"status": "ok", "count": len(migrations)})
     
     except Exception as e:
-        logger. error(f"[Migration] Notification error: {e}")
+        logger.error(f"[Migration] Notification error: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 @app.post("/generate")
 async def generate(request: Request):
     """
-    Generate completion with dynamic load balancing and auto-reconnect on migration.  
+    Generate completion with dynamic load balancing and auto-reconnect on migration. 
     """
     global manager
     assert manager is not None, "EngineManager not initialized."
 
     request_dict = await request.json()
-    text = request_dict. get("text", "")
-    sampling_params = request_dict. get("sampling_params", {})
-    lora_path = request_dict. get("lora_path", "lora0")
+    text = request_dict.get("text", "")
+    sampling_params = request_dict.get("sampling_params", {})
+    lora_path = request_dict.get("lora_path", "lora0")
 
     try:
-        model_id = int(lora_path.replace("lora", "")) if lora_path. startswith("lora") else 0
-    except Exception: 
+        model_id = int(lora_path.replace("lora", "")) if lora_path.startswith("lora") else 0
+    except Exception:
         model_id = 0
 
     request_id = request_dict.get("rid", f"req_{uuid.uuid4().hex[:12]}")
@@ -562,21 +466,21 @@ async def generate(request: Request):
                         "text": text,
                         "sampling_params": sampling_params,
                         "lora_path": lora_path,
-                        "stream":  True,
+                        "stream": True,
                     }
 
                     async with session.post(target_url, json=payload) as resp:
-                        if resp. status != 200:
+                        if resp.status != 200:
                             error_msg = {
                                 "error": f"Backend returned {resp.status}",
                                 "instance_id": instance_id,
-                                "request_id":  request_id,
+                                "request_id": request_id,
                             }
                             yield _ensure_sse_bytes(json.dumps(error_msg))
                             
                             migrated_engine = await _check_migration(request_id)
                             if migrated_engine is not None and retry_count < max_retries - 1:
-                                logger.info(f"[{request_id}] Detected migration to Engine {migrated_engine}, retrying...")
+                                logger. info(f"[{request_id}] Detected migration to Engine {migrated_engine}, retrying...")
                                 instance_id = migrated_engine
                                 retry_count += 1
                                 await asyncio.sleep(0.5)
@@ -585,8 +489,8 @@ async def generate(request: Request):
                                 yield _sse_done()
                                 return
 
-                        async for line in resp.content. iter_any():
-                            if not line:  
+                        async for line in resp.content.iter_any():
+                            if not line: 
                                 continue
                             yield line
 
@@ -611,7 +515,7 @@ async def generate(request: Request):
                         raise
                     
                     error_msg = {
-                        "error":  str(e),
+                        "error": str(e),
                         "instance_id": instance_id,
                         "request_id": request_id,
                         "note": "Connection failed and no migration detected"
@@ -621,9 +525,9 @@ async def generate(request: Request):
                     return
 
             except Exception as e:
-                logger.error(f"[{request_id}] Unexpected error:  {e}")
+                logger.error(f"[{request_id}] Unexpected error: {e}")
                 error_msg = {
-                    "error":  str(e),
+                    "error": str(e),
                     "instance_id": instance_id,
                     "request_id": request_id,
                 }
@@ -642,14 +546,14 @@ async def generate(request: Request):
     return StreamingResponse(stream_from_backend_with_migration(), media_type="text/event-stream")
 
 
-async def _check_migration(request_id:  str) -> Optional[int]:
+async def _check_migration(request_id: str) -> Optional[int]:
     """
     Checks if the request has been migrated to a new engine.
     Returns:  new_engine_id if migrated, None otherwise
     """
     async with migration_map_lock:
         new_engine = request_migration_map.get(request_id)
-        if new_engine is not None: 
+        if new_engine is not None:
             del request_migration_map[request_id]
             return new_engine
     return None
@@ -667,7 +571,7 @@ async def reset_manager_stats():
     global manager
     assert manager is not None
     await manager.reset_stats()
-    return JSONResponse({"status":  "ok"})
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/health")
@@ -677,38 +581,38 @@ async def health():
     return JSONResponse(
         {
             "status": "healthy",
-            "num_instances": manager. num_instances,
+            "num_instances": manager.num_instances,
             "migration_enabled": manager.is_running(),
         }
     )
 
 
 async def shutdown_handler():
-    global manager, monitor
+    global manager, monitoring_task, stop_monitoring_event
     
-    if monitor:
-        monitor.stop_monitoring()
+    if monitoring_task: 
+        logger.info("[Monitor] Stopping monitoring...")
+        stop_monitoring_event. set()
+        await monitoring_task
+        
+        save_monitoring_data()
     
     if manager:
         await manager.close()
 
 
-def run_unified_server(args: argparse. Namespace):
-    global manager, monitor
+def run_unified_server(args:  argparse.Namespace):
+    global manager, monitoring_task, monitoring_output_file
 
     setup_logging(args. log_file, args.log_level)
-
-    logger.info("[Monitor] 初始化资源监控器...")
-    monitor = ResourceMonitor(output_file=args. monitoring_file)
-    monitor.start_monitoring()
-    logger.info("[Monitor] 进入 WARMUP 阶段")
+    
+    logger.info("[Monitor] Starting utilization monitoring (pre-launch)...")
+    monitoring_task = asyncio.create_task(monitor_utilization_loop())
 
     procs, instance_urls = launch_sglang_instances(args, args.log_file)
 
-    logger.info(f"等待实例就绪 ({args.instance_warmup_sec} 秒)...")
-    time.sleep(args. instance_warmup_sec)
-
-    logger.info("[Monitor] 实例就绪，保持 IDLE 阶段")
+    logger.info("\nWaiting for instances to be ready...")
+    time.sleep(args.instance_warmup_sec)
 
     migration_type = MigrationType(args.migration_type)
 
@@ -723,30 +627,24 @@ def run_unified_server(args: argparse. Namespace):
     )
     
     manager.unified_server_url = f"http://{args.host}:{args.port}"
+    
+    if args.monitoring_file:
+        monitoring_output_file = args. monitoring_file
 
     @app.on_event("startup")
     async def start_manager_background_loop():
         await manager.initialize()
         
-        if migration_type != MigrationType. DISPATCH_ONLY:
+        if migration_type != MigrationType.DISPATCH_ONLY:
             logger.info("Starting manager background loop...")
             await manager.start_background_loop()
         else:
             logger.info("Migration disabled (DISPATCH_ONLY).")
-        
-        logger.info("=" * 80)
-        logger.info("🚀 dLoRA 统一服务器已就绪!")
-        logger.info("💡 发送 POST 请求到 /start_benchmark 开始跟踪")
-        if monitor:
-            status = monitor.get_status()
-            logger.info(f"📊 监控状态: {status['data_points_collected']} 个数据点已收集")
-            logger.info(f"📁 输出文件: {status['output_file']}")
-        logger.info("=" * 80)
 
     @app.on_event("shutdown")
     async def shutdown():
         await shutdown_handler()
-        for proc in procs: 
+        for proc in procs:
             try:
                 proc.terminate()
             except Exception:  
@@ -754,16 +652,15 @@ def run_unified_server(args: argparse. Namespace):
 
     logger.info(f"\n[Unified Server] Starting on port {args.port}")
     logger.info(f"[Unified Server] Migration type: {migration_type.name}")
-    if monitor:
-        logger.info(f"[Monitor] Monitoring output:  {monitor.output_file}")
+    logger.info(f"[Monitor] Monitoring output:  {monitoring_output_file or 'auto-generated'}")
 
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level. lower())
-    except KeyboardInterrupt: 
-        logger.info("Terminating...")
+    except KeyboardInterrupt:
+        logger. info("Terminating...")
 
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Launch Unified Server for SGLang Multi-Instance Serving"
     )
@@ -776,7 +673,7 @@ if __name__ == "__main__":
     parser.add_argument("--instance-warmup-sec", type=float, default=20.0)
 
     # Logging config
-    parser. add_argument(
+    parser.add_argument(
         "--log-file",
         type=str,
         default=None,
@@ -798,7 +695,7 @@ if __name__ == "__main__":
         "--monitoring-file",
         type=str,
         default=None,
-        help="监控数据输出文件 (默认自动生成)",
+        help="Output file for monitoring data (default: auto-generated with timestamp)",
     )
 
     # SGLang config
@@ -810,5 +707,5 @@ if __name__ == "__main__":
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
     parser.add_argument("--enable-mscclpp", action="store_true")
 
-    args = parser. parse_args()
+    args = parser.parse_args()
     run_unified_server(args)
