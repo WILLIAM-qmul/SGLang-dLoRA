@@ -454,30 +454,67 @@ class TpModelWorker(BaseTpWorker):
         return batch_result
     
     
-    def merge_adapter(self, lora_id: str):
+    def merge_lora_adapter(self, lora_path: str):
         """
-        Merge 指定的 LoRA adapter
-        """
-        if not hasattr(self. model_runner, 'lora_manager'):
-            logger.error("LoRA manager not initialized")
-            return
+        Merge 指定的 LoRA adapter 到 base model
         
-        lora_manager = self.model_runner. lora_manager
-        model = self.model_runner.model
+        Args:
+            lora_path:  LoRA adapter 的路径（也是其唯一标识）
         
-        lora_manager.merge_adapter(lora_id, model)
-        logger.info(f"[TP Worker {self.tp_rank}] Merged LoRA adapter: {lora_id}")
-    
-    def unmerge_adapter(self):
+        Raises:
+            RuntimeError: 如果 LoRA manager 未初始化
+            ValueError: 如果 adapter 不存在
         """
-        Unmerge 当前的 LoRA adapter
-        """
-        if not hasattr(self.model_runner, 'lora_manager'):
-            logger.error("LoRA manager not initialized")
-            return
+        if not hasattr(self. model_runner, 'lora_manager') or self.model_runner.lora_manager is None:
+            raise RuntimeError("LoRA manager not initialized.  Please check server configuration.")
         
         lora_manager = self.model_runner.lora_manager
         model = self.model_runner.model
         
+        # 获取 LoRA adapter 的 UID
+        lora_uid = self._get_lora_uid_from_path(lora_path)
+        
+        if lora_uid is None:
+            raise ValueError(f"LoRA adapter not found for path: {lora_path}")
+        
+        # 调用 LoRA manager 的 merge 方法
+        lora_manager.merge_adapter(lora_uid, model)
+        
+        logger.info(f"[TP Worker {self.tp_rank}] Merged LoRA:  {lora_path} (uid={lora_uid})")
+    
+    def unmerge_lora_adapter(self):
+        """
+        Unmerge 当前的 LoRA adapter
+        
+        Raises:
+            RuntimeError: 如果 LoRA manager 未初始化
+        """
+        if not hasattr(self.model_runner, 'lora_manager') or self.model_runner.lora_manager is None:
+            raise RuntimeError("LoRA manager not initialized.  Please check server configuration.")
+        
+        lora_manager = self. model_runner.lora_manager
+        model = self.model_runner.model
+        
+        # 调用 LoRA manager 的 unmerge 方法
         lora_manager.unmerge_adapter(model)
+        
         logger.info(f"[TP Worker {self.tp_rank}] Unmerged LoRA adapter")
+    
+    def _get_lora_uid_from_path(self, lora_path: str) -> Optional[str]:
+        """
+        从 lora_path 获取对应的 UID
+        
+        在 SGLang 中，LoRA 通过 LoRARef 管理，path -> uid 的映射
+        
+        Returns:
+            LoRA 的 UID，如果未找到则返回 None
+        """
+        lora_manager = self.model_runner.lora_manager
+        
+        # 遍历已加载的 LoRA adapters
+        for uid, adapter in lora_manager. loras.items():
+            if adapter. config.path == lora_path:
+                return uid
+        
+        logger.warning(f"[TP Worker {self.tp_rank}] LoRA path {lora_path} not found in loaded adapters")
+        return None

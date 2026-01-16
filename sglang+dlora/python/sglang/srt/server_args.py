@@ -562,18 +562,13 @@ class ServerArgs:
     
     # ===== Credit Scheduling 参数 =====
     enable_credit_schedule: bool = False
-    """启用 credit-based dynamic batching 调度"""
+    """Enable credit-based dynamic batching for LoRA adapters"""
     
     merge_threshold: float = 0.8
-    """
-    Merge threshold:  当某个 LoRA 的请求占比超过此值时，考虑 merge
-    范围:  [0.5, 1.0]
-    """
+    """Merge threshold for credit scheduling (0.5-1.0)"""
     
     credit_factor: float = 0.01
-    """
-    Credit 调整因子：每次调度时的 credit 变化量
-    """
+    """Credit adjustment factor"""
 
     def __post_init__(self):
         """
@@ -3640,25 +3635,33 @@ class ServerArgs:
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
         )
-        # For LoRA credit-based scheduling
-        parser.add_argument(
+        
+        # Credit Scheduling group
+        group = parser.add_argument_group("Credit Scheduling Options (for LoRA)")
+        
+        group.add_argument(
             "--enable-credit-schedule",
             action="store_true",
-            help="Enable credit-based dynamic batching scheduling for LoRA adapters"
+            help="Enable credit-based dynamic batching scheduling for LoRA adapters.  "
+                 "This enables dynamic merge/unmerge of LoRA adapters based on request patterns."
         )
         
-        parser.add_argument(
+        group.add_argument(
             "--merge-threshold",
             type=float,
             default=0.8,
-            help="Merge threshold for credit scheduling (default: 0.8)"
+            help="Merge threshold for credit scheduling (default: 0.8). "
+                 "Valid range: [0.5, 1.0].  When a LoRA's request ratio exceeds this threshold, "
+                 "it will be considered for merging into base model."
         )
         
-        parser. add_argument(
+        group.add_argument(
             "--credit-factor",
             type=float,
             default=0.01,
-            help="Credit adjustment factor (default: 0.01)"
+            help="Credit adjustment factor (default: 0.01). "
+                 "Controls how fast credits accumulate for skipped LoRAs. "
+                 "Higher values lead to faster fairness recovery."
         )
 
     @classmethod

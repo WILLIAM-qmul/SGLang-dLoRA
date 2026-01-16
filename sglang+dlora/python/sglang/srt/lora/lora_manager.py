@@ -88,8 +88,7 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
         
-        # 跟踪当前 merged 的 adapter
-        self.merged_adapter_id: Optional[str] = None
+        self.merged_adapter_uid:  Optional[str] = None
 
     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
@@ -470,46 +469,76 @@ class LoRAManager:
                 )
                 
                 
-    def merge_adapter(self, lora_id: str, model: nn.Module):
+    def merge_adapter(self, lora_uid: str, model:  nn.Module):
         """
-        Merge LoRA adapter 到模型中
+        Merge LoRA adapter 到模型的 base weights
         
-        Args: 
-            lora_id: LoRA adapter ID
-            model: 模型实例（如 LlamaForCausalLM）
+        Args:
+            lora_uid: LoRA adapter 的 UID
+            model:  模型实例（如 LlamaForCausalLM）
+        
+        Raises:
+            ValueError: 如果 adapter 不存在
+            RuntimeError: 如果模型不支持 merge
         """
-        if self. merged_adapter_id == lora_id:
-            logger.warning(f"LoRA {lora_id} is already merged")
+        if self.merged_adapter_uid == lora_uid:
+            logger.warning(f"[LoRA Manager] LoRA {lora_uid} is already merged")
             return
         
-        # 先 unmerge 当前的
-        if self.merged_adapter_id is not None:
-            self.unmerge_adapter(model)
+        # 先 unmerge 当前的（如果有）
+        if self.merged_adapter_uid is not None:
+            self. unmerge_adapter(model)
+        
+        # 检查 adapter 是否存在
+        if lora_uid not in self.loras:
+            raise ValueError(f"LoRA adapter {lora_uid} not found in lora_manager. loras")
         
         # 调用模型的 merge 方法
-        if hasattr(model, 'merge_lora_adapter'):
-            model.merge_lora_adapter(lora_id, self)
-            self.merged_adapter_id = lora_id
-        else:
-            logger.error(f"Model {type(model)} does not support LoRA merging")
+        if not hasattr(model, 'merge_lora_adapter'):
+            raise RuntimeError(
+                f"Model {type(model).__name__} does not support LoRA merging.  "
+                f"Please implement merge_lora_adapter() method."
+            )
+        
+        model.merge_lora_adapter(lora_uid, self)
+        self.merged_adapter_uid = lora_uid
+        
+        logger.info(f"[LoRA Manager] Successfully merged adapter:  {lora_uid}")
     
     def unmerge_adapter(self, model: nn.Module):
         """
         Unmerge 当前的 LoRA adapter
+        
+        Args:
+            model: 模型实例
+        
+        Raises:
+            RuntimeError: 如果模型不支持 unmerge
         """
-        if self. merged_adapter_id is None: 
-            logger.warning("No LoRA adapter is currently merged")
+        if self.merged_adapter_uid is None:
+            logger.warning("[LoRA Manager] No LoRA adapter is currently merged")
             return
         
         # 调用模型的 unmerge 方法
-        if hasattr(model, 'unmerge_lora_adapter'):
-            model.unmerge_lora_adapter(self)
-            self.merged_adapter_id = None
-        else:
-            logger.error(f"Model {type(model)} does not support LoRA unmerging")
+        if not hasattr(model, 'unmerge_lora_adapter'):
+            raise RuntimeError(
+                f"Model {type(model).__name__} does not support LoRA unmerging. "
+                f"Please implement unmerge_lora_adapter() method."
+            )
+        
+        model. unmerge_lora_adapter(self)
+        
+        logger.info(f"[LoRA Manager] Successfully unmerged adapter: {self.merged_adapter_uid}")
+        self.merged_adapter_uid = None
     
-    def is_merged(self, lora_id: str) -> bool:
+    def is_merged(self, lora_uid: str) -> bool:
         """
         检查指定的 LoRA 是否已 merged
         """
-        return self. merged_adapter_id == lora_id
+        return self.merged_adapter_uid == lora_uid
+    
+    def get_merged_adapter(self) -> Optional[str]:
+        """
+        获取当前 merged 的 adapter UID
+        """
+        return self.merged_adapter_uid

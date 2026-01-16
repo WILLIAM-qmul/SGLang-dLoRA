@@ -745,31 +745,39 @@ class LlamaForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
             
     
-    def merge_lora_adapter(self, lora_id: str, lora_manager):
+    def merge_lora_adapter(self, lora_uid: str, lora_manager):
         """
-        Merge 指定的 LoRA adapter 到 base weights
+        Merge LoRA adapter 到 base weights
         
-        Args:
-            lora_id: LoRA adapter 的 ID
+        核心算法：
+        对于每个 LoRA 模块，计算 delta = scaling * (B @ A)，然后 base_weight += delta
+        
+        Args: 
+            lora_uid: LoRA adapter 的 UID
             lora_manager: LoRA 管理器实例
+        
+        Raises: 
+            ValueError: 如果 adapter 不存在
         """
-        if self.merged_lora_id == lora_id:
-            logger.warning(f"LoRA {lora_id} is already merged")
+        if self.merged_lora_uid == lora_uid:
+            logger.warning(f"[LLaMA] LoRA {lora_uid} is already merged")
             return
         
         # 先 unmerge 当前的（如果有）
-        if self.merged_lora_id is not None:
+        if self.merged_lora_uid is not None:
             self. unmerge_lora_adapter(lora_manager)
         
         # 获取 LoRA adapter
-        if lora_id not in lora_manager.loras:
-            logger.error(f"LoRA adapter {lora_id} not found in lora_manager")
-            return
+        if lora_uid not in lora_manager.loras:
+            raise ValueError(f"LoRA adapter {lora_uid} not found in lora_manager")
         
-        lora_adapter = lora_manager.loras[lora_id]
+        lora_adapter = lora_manager.loras[lora_uid]
+        scaling = lora_adapter.scaling
         
         # 遍历所有 decoder layers
         num_layers = len(self.model.layers)
+        
+        logger.info(f"[LLaMA] Starting merge of LoRA {lora_uid} (scaling={scaling:. 4f}, layers={num_layers})")
         
         for layer_idx in range(num_layers):
             decoder_layer = self.model.layers[layer_idx]
@@ -777,37 +785,46 @@ class LlamaForCausalLM(nn.Module):
             
             # Merge attention weights (qkv_proj, o_proj)
             self._merge_attention_weights(
-                decoder_layer.self_attn,
+                layer_idx,
+                decoder_layer. self_attn,
                 lora_layer_weights,
-                lora_adapter.scaling
+                scaling
             )
             
             # Merge MLP weights (gate_up_proj, down_proj)
             self._merge_mlp_weights(
+                layer_idx,
                 decoder_layer.mlp,
                 lora_layer_weights,
-                lora_adapter.scaling
+                scaling
             )
         
-        self.merged_lora_id = lora_id
-        logger. info(f"[LLaMA] Successfully merged LoRA adapter: {lora_id}")
+        self.merged_lora_uid = lora_uid
+        logger. info(f"[LLaMA] Successfully merged LoRA:  {lora_uid}")
     
     def unmerge_lora_adapter(self, lora_manager):
         """
         Unmerge 当前的 LoRA adapter
+        
+        核心算法：
+        计算 delta = scaling * (B @ A)，然后 base_weight -= delta
         """
-        if self.merged_lora_id is None: 
-            logger.warning("No LoRA adapter is currently merged")
+        if self.merged_lora_uid is None:
+            logger.warning("[LLaMA] No LoRA adapter is currently merged")
             return
         
         # 获取 LoRA adapter
-        lora_adapter = lora_manager.loras. get(self.merged_lora_id)
+        lora_adapter = lora_manager.loras. get(self.merged_lora_uid)
         if lora_adapter is None:
-            logger.error(f"LoRA adapter {self.merged_lora_id} not found")
+            logger.error(f"[LLaMA] LoRA adapter {self.merged_lora_uid} not found, cannot unmerge")
             return
+        
+        scaling = lora_adapter.scaling
         
         # 遍历所有 decoder layers
         num_layers = len(self.model.layers)
+        
+        logger.info(f"[LLaMA] Starting unmerge of LoRA {self.merged_lora_uid} (layers={num_layers})")
         
         for layer_idx in range(num_layers):
             decoder_layer = self.model.layers[layer_idx]
@@ -815,55 +832,111 @@ class LlamaForCausalLM(nn.Module):
             
             # Unmerge attention weights
             self._unmerge_attention_weights(
+                layer_idx,
                 decoder_layer.self_attn,
                 lora_layer_weights,
-                lora_adapter.scaling
+                scaling
             )
             
             # Unmerge MLP weights
             self._unmerge_mlp_weights(
-                decoder_layer.mlp,
+                layer_idx,
+                decoder_layer. mlp,
                 lora_layer_weights,
-                lora_adapter.scaling
+                scaling
             )
         
-        logger.info(f"[LLaMA] Successfully unmerged LoRA adapter: {self.merged_lora_id}")
-        self.merged_lora_id = None
+        logger.info(f"[LLaMA] Successfully unmerged LoRA: {self.merged_lora_uid}")
+        self.merged_lora_uid = None
     
     def _merge_attention_weights(
         self,
+        layer_idx: int,
         attention_module,
-        lora_weights:  Dict[str, torch.Tensor],
+        lora_weights: Dict[str, torch.Tensor],
         scaling: float
     ):
         """
         Merge LoRA weights for attention module
+        
+        处理：qkv_proj, o_proj
         """
-        # QKV projection
-        qkv_lora_a = lora_weights. get('self_attn.qkv_proj.lora_A. weight')
-        qkv_lora_b = lora_weights. get('self_attn.qkv_proj.lora_B.weight')
+        # 查找 qkv_proj 的 LoRA 权重
+        qkv_lora_a = None
+        qkv_lora_b = None
+        
+        # 尝试不同的 key 格式
+        for key_suffix in ['self_attn.qkv_proj.lora_A. weight', 'qkv_proj.lora_A.weight']: 
+            for key in lora_weights. keys():
+                if key.endswith(key_suffix):
+                    qkv_lora_a = lora_weights[key]
+                    break
+            if qkv_lora_a is not None:
+                break
+        
+        for key_suffix in ['self_attn.qkv_proj. lora_B.weight', 'qkv_proj.lora_B.weight']:
+            for key in lora_weights. keys():
+                if key.endswith(key_suffix):
+                    qkv_lora_b = lora_weights[key]
+                    break
+            if qkv_lora_b is not None:
+                break
         
         if qkv_lora_a is not None and qkv_lora_b is not None:
-            # 计算 LoRA delta:  scaling * B @ A
-            lora_delta = scaling * (qkv_lora_b @ qkv_lora_a)
-            
-            # Merge 到 base weights
-            attention_module.qkv_proj.weight.data += lora_delta
-            
-            logger.debug(f"Merged qkv_proj:  delta shape {lora_delta.shape}")
+            with torch.no_grad():
+                # 确保 tensors 在同一设备上
+                device = attention_module.qkv_proj.weight.device
+                qkv_lora_a = qkv_lora_a.to(device)
+                qkv_lora_b = qkv_lora_b.to(device)
+                
+                # 计算 delta = scaling * (B @ A)
+                lora_delta = scaling * torch.matmul(qkv_lora_b, qkv_lora_a)
+                
+                # Merge 到 base weights
+                attention_module.qkv_proj.weight.data. add_(lora_delta)
+                
+                logger.debug(
+                    f"[LLaMA] Layer {layer_idx}:  Merged qkv_proj "
+                    f"(delta_norm={lora_delta.norm().item():.4f})"
+                )
         
-        # O projection
-        o_lora_a = lora_weights.get('self_attn.o_proj.lora_A.weight')
-        o_lora_b = lora_weights.get('self_attn.o_proj.lora_B.weight')
+        # 查找 o_proj 的 LoRA 权重
+        o_lora_a = None
+        o_lora_b = None
+        
+        for key_suffix in ['self_attn.o_proj.lora_A.weight', 'o_proj.lora_A. weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    o_lora_a = lora_weights[key]
+                    break
+            if o_lora_a is not None:
+                break
+        
+        for key_suffix in ['self_attn.o_proj.lora_B.weight', 'o_proj.lora_B.weight']:
+            for key in lora_weights. keys():
+                if key.endswith(key_suffix):
+                    o_lora_b = lora_weights[key]
+                    break
+            if o_lora_b is not None: 
+                break
         
         if o_lora_a is not None and o_lora_b is not None:
-            lora_delta = scaling * (o_lora_b @ o_lora_a)
-            attention_module.o_proj.weight.data += lora_delta
-            
-            logger.debug(f"Merged o_proj: delta shape {lora_delta.shape}")
+            with torch.no_grad():
+                device = attention_module.o_proj.weight.device
+                o_lora_a = o_lora_a.to(device)
+                o_lora_b = o_lora_b. to(device)
+                
+                lora_delta = scaling * torch. matmul(o_lora_b, o_lora_a)
+                attention_module.o_proj.weight.data.add_(lora_delta)
+                
+                logger. debug(
+                    f"[LLaMA] Layer {layer_idx}: Merged o_proj "
+                    f"(delta_norm={lora_delta. norm().item():.4f})"
+                )
     
     def _unmerge_attention_weights(
         self,
+        layer_idx: int,
         attention_module,
         lora_weights:  Dict[str, torch.Tensor],
         scaling: float
@@ -871,75 +944,242 @@ class LlamaForCausalLM(nn.Module):
         """
         Unmerge LoRA weights for attention module
         """
-        # QKV projection
-        qkv_lora_a = lora_weights.get('self_attn.qkv_proj. lora_A.weight')
-        qkv_lora_b = lora_weights.get('self_attn.qkv_proj.lora_B.weight')
+        # qkv_proj
+        qkv_lora_a = None
+        qkv_lora_b = None
+        
+        for key_suffix in ['self_attn.qkv_proj. lora_A.weight', 'qkv_proj.lora_A.weight']:
+            for key in lora_weights. keys():
+                if key.endswith(key_suffix):
+                    qkv_lora_a = lora_weights[key]
+                    break
+            if qkv_lora_a is not None:
+                break
+        
+        for key_suffix in ['self_attn.qkv_proj.lora_B.weight', 'qkv_proj.lora_B. weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    qkv_lora_b = lora_weights[key]
+                    break
+            if qkv_lora_b is not None: 
+                break
         
         if qkv_lora_a is not None and qkv_lora_b is not None: 
-            lora_delta = scaling * (qkv_lora_b @ qkv_lora_a)
-            attention_module.qkv_proj.weight.data -= lora_delta
+            with torch.no_grad():
+                device = attention_module.qkv_proj.weight.device
+                qkv_lora_a = qkv_lora_a.to(device)
+                qkv_lora_b = qkv_lora_b.to(device)
+                
+                lora_delta = scaling * torch. matmul(qkv_lora_b, qkv_lora_a)
+                attention_module.qkv_proj.weight.data.sub_(lora_delta)
         
-        # O projection
-        o_lora_a = lora_weights.get('self_attn.o_proj.lora_A.weight')
-        o_lora_b = lora_weights.get('self_attn.o_proj.lora_B.weight')
+        # o_proj
+        o_lora_a = None
+        o_lora_b = None
+        
+        for key_suffix in ['self_attn.o_proj.lora_A.weight', 'o_proj.lora_A.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    o_lora_a = lora_weights[key]
+                    break
+            if o_lora_a is not None:
+                break
+        
+        for key_suffix in ['self_attn.o_proj.lora_B.weight', 'o_proj.lora_B.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    o_lora_b = lora_weights[key]
+                    break
+            if o_lora_b is not None: 
+                break
         
         if o_lora_a is not None and o_lora_b is not None:
-            lora_delta = scaling * (o_lora_b @ o_lora_a)
-            attention_module.o_proj. weight.data -= lora_delta
+            with torch. no_grad():
+                device = attention_module.o_proj. weight.device
+                o_lora_a = o_lora_a.to(device)
+                o_lora_b = o_lora_b.to(device)
+                
+                lora_delta = scaling * torch. matmul(o_lora_b, o_lora_a)
+                attention_module. o_proj.weight.data. sub_(lora_delta)
     
     def _merge_mlp_weights(
         self,
+        layer_idx: int,
         mlp_module,
-        lora_weights:  Dict[str, torch.Tensor],
+        lora_weights: Dict[str, torch.Tensor],
         scaling: float
     ):
         """
         Merge LoRA weights for MLP module
+        
+        处理：gate_up_proj, down_proj
         """
-        # Gate-Up projection
-        gate_up_lora_a = lora_weights.get('mlp.gate_up_proj.lora_A.weight')
-        gate_up_lora_b = lora_weights.get('mlp. gate_up_proj.lora_B.weight')
+        # gate_up_proj
+        gate_up_lora_a = None
+        gate_up_lora_b = None
+        
+        for key_suffix in ['mlp.gate_up_proj. lora_A.weight', 'gate_up_proj.lora_A.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    gate_up_lora_a = lora_weights[key]
+                    break
+            if gate_up_lora_a is not None:
+                break
+        
+        for key_suffix in ['mlp.gate_up_proj. lora_B.weight', 'gate_up_proj.lora_B.weight']:
+            for key in lora_weights. keys():
+                if key.endswith(key_suffix):
+                    gate_up_lora_b = lora_weights[key]
+                    break
+            if gate_up_lora_b is not None:
+                break
         
         if gate_up_lora_a is not None and gate_up_lora_b is not None:
-            lora_delta = scaling * (gate_up_lora_b @ gate_up_lora_a)
-            mlp_module.gate_up_proj.weight.data += lora_delta
-            
-            logger.debug(f"Merged gate_up_proj: delta shape {lora_delta.shape}")
+            with torch.no_grad():
+                device = mlp_module.gate_up_proj.weight.device
+                gate_up_lora_a = gate_up_lora_a.to(device)
+                gate_up_lora_b = gate_up_lora_b.to(device)
+                
+                lora_delta = scaling * torch.matmul(gate_up_lora_b, gate_up_lora_a)
+                mlp_module.gate_up_proj.weight.data.add_(lora_delta)
+                
+                logger.debug(
+                    f"[LLaMA] Layer {layer_idx}:  Merged gate_up_proj "
+                    f"(delta_norm={lora_delta.norm().item():.4f})"
+                )
         
-        # Down projection
-        down_lora_a = lora_weights.get('mlp.down_proj.lora_A.weight')
-        down_lora_b = lora_weights.get('mlp.down_proj.lora_B. weight')
+        # down_proj
+        down_lora_a = None
+        down_lora_b = None
+        
+        for key_suffix in ['mlp.down_proj.lora_A.weight', 'down_proj.lora_A.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    down_lora_a = lora_weights[key]
+                    break
+            if down_lora_a is not None:
+                break
+        
+        for key_suffix in ['mlp.down_proj.lora_B.weight', 'down_proj.lora_B.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    down_lora_b = lora_weights[key]
+                    break
+            if down_lora_b is not None: 
+                break
         
         if down_lora_a is not None and down_lora_b is not None:
-            lora_delta = scaling * (down_lora_b @ down_lora_a)
-            mlp_module.down_proj.weight. data += lora_delta
-            
-            logger.debug(f"Merged down_proj: delta shape {lora_delta.shape}")
+            with torch. no_grad():
+                device = mlp_module.down_proj.weight.device
+                down_lora_a = down_lora_a.to(device)
+                down_lora_b = down_lora_b. to(device)
+                
+                lora_delta = scaling * torch.matmul(down_lora_b, down_lora_a)
+                mlp_module.down_proj.weight. data.add_(lora_delta)
+                
+                logger.debug(
+                    f"[LLaMA] Layer {layer_idx}: Merged down_proj "
+                    f"(delta_norm={lora_delta.norm().item():.4f})"
+                )
     
     def _unmerge_mlp_weights(
         self,
+        layer_idx: int,
         mlp_module,
-        lora_weights: Dict[str, torch. Tensor],
+        lora_weights: Dict[str, torch.Tensor],
         scaling: float
     ):
         """
         Unmerge LoRA weights for MLP module
         """
-        # Gate-Up projection
-        gate_up_lora_a = lora_weights.get('mlp.gate_up_proj. lora_A.weight')
-        gate_up_lora_b = lora_weights.get('mlp.gate_up_proj.lora_B.weight')
+        # gate_up_proj
+        gate_up_lora_a = None
+        gate_up_lora_b = None
+        
+        for key_suffix in ['mlp.gate_up_proj.lora_A.weight', 'gate_up_proj.lora_A. weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    gate_up_lora_a = lora_weights[key]
+                    break
+            if gate_up_lora_a is not None: 
+                break
+        
+        for key_suffix in ['mlp. gate_up_proj.lora_B.weight', 'gate_up_proj.lora_B.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    gate_up_lora_b = lora_weights[key]
+                    break
+            if gate_up_lora_b is not None:
+                break
         
         if gate_up_lora_a is not None and gate_up_lora_b is not None:
-            lora_delta = scaling * (gate_up_lora_b @ gate_up_lora_a)
-            mlp_module.gate_up_proj.weight.data -= lora_delta
+            with torch.no_grad():
+                device = mlp_module.gate_up_proj.weight.device
+                gate_up_lora_a = gate_up_lora_a.to(device)
+                gate_up_lora_b = gate_up_lora_b.to(device)
+                
+                lora_delta = scaling * torch.matmul(gate_up_lora_b, gate_up_lora_a)
+                mlp_module.gate_up_proj.weight.data.sub_(lora_delta)
         
-        # Down projection
-        down_lora_a = lora_weights.get('mlp.down_proj.lora_A.weight')
-        down_lora_b = lora_weights.get('mlp.down_proj.lora_B. weight')
+        # down_proj
+        down_lora_a = None
+        down_lora_b = None
+        
+        for key_suffix in ['mlp.down_proj.lora_A.weight', 'down_proj.lora_A.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    down_lora_a = lora_weights[key]
+                    break
+            if down_lora_a is not None:
+                break
+        
+        for key_suffix in ['mlp.down_proj.lora_B.weight', 'down_proj.lora_B.weight']:
+            for key in lora_weights.keys():
+                if key.endswith(key_suffix):
+                    down_lora_b = lora_weights[key]
+                    break
+            if down_lora_b is not None:
+                break
         
         if down_lora_a is not None and down_lora_b is not None:
-            lora_delta = scaling * (down_lora_b @ down_lora_a)
-            mlp_module.down_proj.weight. data -= lora_delta
+            with torch.no_grad():
+                device = mlp_module.down_proj.weight.device
+                down_lora_a = down_lora_a.to(device)
+                down_lora_b = down_lora_b.to(device)
+                
+                lora_delta = scaling * torch.matmul(down_lora_b, down_lora_a)
+                mlp_module. down_proj.weight.data. sub_(lora_delta)
+    
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """
+        获取指定模块的输入输出维度（用于 LoRA 计算）
+        
+        这个方法被 LoRA 管理器调用
+        """
+        config = self.config
+        head_dim = getattr(
+            config, "head_dim",
+            config.hidden_size // config.num_attention_heads
+        )
+        
+        if module_name == "qkv_proj":
+            input_dim = config.hidden_size
+            output_dim = head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "o_proj": 
+            input_dim = head_dim * config.num_attention_heads
+            output_dim = config.hidden_size
+        elif module_name == "gate_up_proj":
+            input_dim = config.hidden_size
+            output_dim = config.intermediate_size * 2
+        elif module_name == "down_proj":
+            input_dim = config.intermediate_size
+            output_dim = config.hidden_size
+        else:
+            raise NotImplementedError(f"Module {module_name} not supported")
+        
+        return input_dim, output_dim
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
