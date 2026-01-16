@@ -1,5 +1,0 @@
-{"timestamp": "2026-01-13T01:32:36.123456", "phase": "launching_instances", "cpu_memory_util": 16.0}
-{"timestamp": "2026-01-13T01:32:46.123456", "phase": "launching_instances", "cpu_memory_util": 20.0}
-{"timestamp": "2026-01-13T01:32:56.123456", "phase": "idle", "cpu_memory_util": 25.0}
-{"timestamp": "2026-01-13T01:33:06.123456", "phase": "benchmarking", "cpu_memory_util": 26.5}
-{"timestamp": "2026-01-13T01:34:06.123456", "phase": "benchmarking", "cpu_memory_util": 27.0}
