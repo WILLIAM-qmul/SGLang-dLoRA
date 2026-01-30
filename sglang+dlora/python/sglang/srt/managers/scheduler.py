@@ -24,7 +24,8 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union, Set
+from collections import defaultdict
 
 import psutil
 import setproctitle
@@ -1674,6 +1675,21 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        """
+        - 先整理状态
+            - 有 chunked_req：把它暂存并释放占用的 token 池，不参与本轮合并。
+            - 如果上一轮是 prefill（last_batch.is_extend）：把过期的 chunked_req 剔除；若 last_batch 里有可进入解码的请求，就并入 running_batch（让它们参与后续 decode）。
+        - 优先尝试拼一个新的 prefill 批次
+            - 调用 get_new_batch_prefill，尽量从 waiting_queue（加上可能的 chunked 续跑）凑出 new_batch。
+            - 若需要 DP attention 同步（且用了推测解码），可能会把 new_batch“准备/对齐”，准备失败的话视为没有 prefill。
+        - 选择本轮要跑的批次
+            - 如果凑到了 new_batch（prefill），本轮先跑 prefill。
+            - 否则，如果 running_batch 里还有在解码的请求，就更新 running_batch（清理已完成、必要时回缩以避 OOM），继续跑 decode。
+            - 否则，没有可运行的批次，空转。
+        - DP attention 收尾
+            - 若还需要 DP attention 的准备，再对选中的批次做一次 prepare。
+        - 记录 trace，返回要跑的批次。
+        """
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1750,7 +1766,7 @@ class Scheduler(
 
     def _init_credit_scheduling(self, server_args:  ServerArgs):
         """
-        初始化 Credit Scheduling 相关的状态
+        Initialize credit-based scheduling for LoRA adapters.
         """
         self.enable_credit_schedule = server_args.enable_credit_schedule
         
@@ -1760,8 +1776,8 @@ class Scheduler(
         self.merge_threshold = server_args.merge_threshold
         self. credit_factor = server_args. credit_factor
         
-        # Credit tracking:  lora_path -> credit_value
-        self.lora_credits: Dict[str, float] = defaultdict(float)
+        # Credit tracking
+        self.lora_credits:  Dict[str, float] = defaultdict(float)
         
         # Statistics
         self.merge_count = 0
@@ -1770,172 +1786,374 @@ class Scheduler(
         # Current merged adapter
         self.merged_adapter_path:  Optional[str] = None
         
-        # Credit schedule state (used internally)
-        self._credit_target_lora:  Optional[str] = None
-        
         logger.info(
-            f"[Credit Schedule] Initialized:  "
-            f"threshold={self.merge_threshold:.2f}, "
+            f"[Credit Schedule] Initialized:  threshold={self.merge_threshold:.2f}, "
             f"factor={self.credit_factor:.4f}"
         )
     
-    # ========== Credit Scheduling 核心方法 ==========
-    
-    def _should_schedule_req_with_credit(self, req:  Req) -> bool:
+    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]: 
         """
-        判断是否应该调度某个请求（Credit Scheduling 过滤器）
+        Get a new prefill batch
         
-        这个方法在 get_new_batch_prefill 中被调用
+        If credit scheduling is enabled, use credit-based scheduling;
+        otherwise, use the original logic.
+        """
+        if not self.enable_credit_schedule:
+            return self._get_new_batch_prefill_original()
+        
+        return self._get_new_batch_prefill_with_credit()
+    
+    def _get_new_batch_prefill_original(self) -> Optional[ScheduleBatch]:
+        """
+        original logic for getting a new prefill batch.
+        """
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        if self.try_preemption:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
+        # Handle the cases where prefill is not allowed
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked request has just been released.
+        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not self.chunked_req
+            and not self.try_preemption
+        ):
+            self.running_batch.batch_is_full = True
+            return None
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
+        # Get priority queue
+        self.policy.calc_priority(self.waiting_queue)
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            # If we are testing retraction and the running batch size exceeds
+            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
+            # in the waiting queue.
+            return None
+
+        # Prefill policy
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            self.running_batch,
+            self.new_token_ratio,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
+        )
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        if self.enable_lora:
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_id for req in adder.can_run_list])
+                | set([req.lora_id])
+            ):
+                self.running_batch.batch_is_full = True
+                break
+
+            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                self.running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption:
+                    break
+                if not adder.preempt_to_schedule(req, self.server_args):
+                    break
+
+            if self.enable_hicache_storage:
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
+
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.running_batch.batch_is_full = len(
+                            adder.can_run_list
+                        ) > 0 or (not self.running_batch.is_empty())
+                    else:
+                        self.running_batch.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list: List[Req] = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.add_latency(RequestStage.PREFILL_WAITING)
+
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
+
+        # Print stats
+        if self.current_scheduler_metrics_enabled():
+            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                # Avoid update chunked request many times
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+        )
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+
+        new_batch.prepare_for_extend()
+
+        # Mixed-style chunked prefill
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            )
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch
+    
+    def _get_new_batch_prefill_with_credit(self) -> Optional[ScheduleBatch]: 
+        """
+        Credit-based prefill scheduling
+
+        Core logic:
+        1. Analyze the waiting_queue to determine the scheduling strategy
+        2. If filtering is needed (merge mode), temporarily replace the waiting_queue
+        3. Call the original prefill logic
+        4. Restore the waiting_queue and update credits
+        """
+        self.schedule_count += 1
+        
+        # Step 1: analyze strategy
+        target_lora, should_merge = self._analyze_credit_schedule_strategy()
+        
+        if target_lora is None:
+            # FCFS mode: directly call original logic
+            batch = self._get_new_batch_prefill_original()
+            
+            if batch is not None:
+                self._update_credit_after_schedule(batch.reqs, fcfs_mode=True)
+            
+            return batch
+        
+        # Step 2: conduct merge if needed
+        if should_merge:
+            success = self._merge_adapter(target_lora)
+            if success:
+                self. merge_count += 1
+        
+        # Step 3: filter requests for the target LoRA
+        original_queue = list(self.waiting_queue)
+        filtered_queue = [
+            req for req in self.waiting_queue
+            if getattr(req, 'lora_path', None) == target_lora
+        ]
+        
+        if not filtered_queue:
+            return self._get_new_batch_prefill_original()
+        
+        # Step 4: filter waiting_queue
+        self.waiting_queue = filtered_queue
+        
+        try:
+            # Step 5: call original logic (will automatically remove scheduled requests from self.waiting_queue)
+            batch = self._get_new_batch_prefill_original()
+            
+            # Step 6: restore waiting_queue
+            if batch is not None:
+                scheduled_reqs = set(batch.reqs)
+                self.waiting_queue = [
+                    req for req in original_queue
+                    if req not in scheduled_reqs
+                ]
+
+                # Step 7: update credit
+                self._update_credit_after_schedule(batch.reqs, fcfs_mode=False)
+            else:
+                self.waiting_queue = original_queue
+            
+            return batch
+        
+        except Exception as e:
+            logger.error(f"[Credit Schedule] Error during scheduling: {e}", exc_info=True)
+            self.waiting_queue = original_queue
+            raise
+    
+    def _analyze_credit_schedule_strategy(self) -> tuple[Optional[str], bool]: 
+        """
+        分析 waiting_queue，决定调度策略
         
         Returns:
-            True: 应该调度该请求
-            False: 应该跳过该请求
+            (target_lora, should_merge):
+                - target_lora:  目标 LoRA path，None 表示 FCFS 模式
+                - should_merge: 是否需要执行 merge 操作
         """
-        if not self.enable_credit_schedule:
-            return True  # 未启用，所有请求都调度
-        
-        if self._credit_target_lora is None:
-            return True  # 没有目标 LoRA，所有请求都调度
-        
-        # 获取请求的 LoRA path
-        req_lora = getattr(req, 'lora_path', None)
-        
-        # 只调度目标 LoRA 的请求
-        return req_lora == self._credit_target_lora
-    
-    def _prepare_credit_schedule_state(self):
-        """
-        在每次 prefill 调度前调用，决定调度策略
-        
-        这个方法分析 waiting_queue，决定：
-        1. 是否应该 merge 某个 adapter
-        2. 是否应该 unmerge 当前的 adapter
-        3. 设置 _credit_target_lora（用于过滤）
-        """
-        if not self.enable_credit_schedule:
-            self._credit_target_lora = None
-            return
-        
-        self. schedule_count += 1
-        
-        # 收集所有等待的请求
-        available_reqs = list(self.waiting_queue)
-        if not available_reqs:
-            self._credit_target_lora = None
-            return
+        if not self.waiting_queue:
+            return None, False
         
         # 统计各 LoRA 的请求数
         lora_counts:  Dict[Optional[str], int] = defaultdict(int)
-        for req in available_reqs:
+        for req in self.waiting_queue:
             lora_path = getattr(req, 'lora_path', None)
             lora_counts[lora_path] += 1
         
-        total_reqs = len(available_reqs)
+        total_reqs = len(self.waiting_queue)
         
         # Case 1: 如果当前有 merged adapter，检查是否保持 merge
-        if self.merged_adapter_path is not None: 
+        if self.merged_adapter_path is not None:
             merged_count = lora_counts. get(self.merged_adapter_path, 0)
             
             if merged_count > 0:
                 merge_ratio = merged_count / total_reqs
                 
                 if merge_ratio >= self.merge_threshold:
-                    # 保持 merge，只调度该 LoRA 的请求
-                    self._credit_target_lora = self.merged_adapter_path
-                    
+                    # 保持 merge
                     logger.debug(
-                        f"[Credit] Keep merge:  {self.merged_adapter_path} "
+                        f"[Credit] Keep merge: {self.merged_adapter_path} "
                         f"({merged_count}/{total_reqs}={merge_ratio:.2%})"
                     )
-                    return
+                    return self.merged_adapter_path, False  # 不需要重新 merge
             
             # Unmerge
             logger.info(
                 f"[Credit] Unmerge {self.merged_adapter_path} "
-                f"(ratio={merged_count}/{total_reqs}={merged_count/total_reqs:.2%} < {self.merge_threshold:. 2%})"
+                f"(ratio={merged_count/total_reqs:.2%} < {self.merge_threshold:.2%})"
             )
             self._unmerge_adapter()
         
         # Case 2: 检查是否应该 merge 某个 adapter
-        # 找出请求数最多的 LoRA（排除 None）
         max_lora = None
         max_count = 0
         
         for lora_path, count in lora_counts.items():
-            if lora_path is None:
+            if lora_path is None:  # 跳过 base model
                 continue
             if count > max_count:
                 max_lora = lora_path
                 max_count = count
         
         if max_lora and max_count / total_reqs >= self.merge_threshold:
-            lora_credit = self. lora_credits[max_lora]
+            lora_credit = self.lora_credits[max_lora]
             
             if lora_credit <= 0.1:  # Credit threshold
-                # Merge this adapter
-                success = self._merge_adapter(max_lora)
-                
-                if success:
-                    self._credit_target_lora = max_lora
-                    self.merge_count += 1
-                    
-                    logger.info(
-                        f"[Credit] Merged {max_lora} "
-                        f"({max_count}/{total_reqs}={max_count/total_reqs:.2%}, "
-                        f"credit={lora_credit:.4f})"
-                    )
-                    return
+                # 应该 merge
+                logger.info(
+                    f"[Credit] Will merge {max_lora} "
+                    f"({max_count}/{total_reqs}={max_count/total_reqs:.2%}, credit={lora_credit:.4f})"
+                )
+                return max_lora, True  # 需要 merge
             else:
                 logger.debug(
-                    f"[Credit] Skip merge {max_lora}:  "
-                    f"credit too high ({lora_credit:.4f} > 0.1)"
+                    f"[Credit] Skip merge {max_lora}:  credit too high ({lora_credit:.4f})"
                 )
         
-        # Case 3: FCFS mode - 调度所有请求
-        self._credit_target_lora = None
+        # Case 3: FCFS 模式
+        return None, False
     
-    def _finalize_credit_schedule_state(self, scheduled_reqs: List[Req]):
+    def _update_credit_after_schedule(self, scheduled_reqs: List, fcfs_mode: bool):
         """
-        在 batch 构建完成后调用，更新 credit 值
-        
-        Args:
-            scheduled_reqs:  实际调度的请求列表
+        adjust credits after scheduling
         """
-        if not self.enable_credit_schedule:
-            return
-        
-        # 收集 FCFS 应该选择的 LoRA IDs（前 N 个）
+        # collect FCFS LoRA IDs
         fcfs_lora_ids = set()
         count = 0
-        for req in self.waiting_queue:
+        for req in list(self.waiting_queue) + scheduled_reqs:
             if count >= len(scheduled_reqs):
                 break
             lora_path = getattr(req, 'lora_path', None)
-            if lora_path and lora_path != self. merged_adapter_path:
-                fcfs_lora_ids. add(lora_path)
+            if lora_path and lora_path != self.merged_adapter_path:
+                fcfs_lora_ids.add(lora_path)
             count += 1
         
-        # 收集实际调度的 LoRA IDs
+        # collect scheduled LoRA IDs
         scheduled_lora_ids = set()
         for req in scheduled_reqs:
             lora_path = getattr(req, 'lora_path', None)
             if lora_path and lora_path != self.merged_adapter_path:
                 scheduled_lora_ids.add(lora_path)
         
-        # 调整 credit
-        self._adjust_credit(fcfs_lora_ids, scheduled_lora_ids)
-        
-        # 调整 threshold
-        self._adjust_merge_threshold()
-        
-        # 重置状态
-        self._credit_target_lora = None
-    
-    def _adjust_credit(self, fcfs_lora_ids: Set[str], scheduled_lora_ids: Set[str]):
-        """
-        调整 LoRA adapters 的 credit 值
-        """
-        # 被跳过的 LoRA:  credit += factor
+        # adjust credit
         skipped = fcfs_lora_ids - scheduled_lora_ids
         for lora_path in skipped: 
             self.lora_credits[lora_path] += self.credit_factor
@@ -1944,19 +2162,20 @@ class Scheduler(
                 f"credit += {self.credit_factor:. 4f} -> {self.lora_credits[lora_path]:.4f}"
             )
         
-        # 实际调度的 LoRA: credit -= factor
-        for lora_path in scheduled_lora_ids: 
+        for lora_path in scheduled_lora_ids:
             if lora_path in self.lora_credits:
                 old = self.lora_credits[lora_path]
                 self. lora_credits[lora_path] = max(0.0, old - self.credit_factor)
                 logger.debug(
                     f"[Credit] Scheduled {lora_path}: "
-                    f"credit -= {self. credit_factor:.4f} -> {self.lora_credits[lora_path]:.4f}"
+                    f"credit -= {self.credit_factor:.4f} -> {self.lora_credits[lora_path]:.4f}"
                 )
+        
+        self._adjust_merge_threshold()
     
     def _adjust_merge_threshold(self):
         """
-        动态调整 merge threshold
+        Dynamically adjust the merge threshold based on recent merge ratio
         """
         if self.schedule_count >= 100: 
             merge_ratio = self.merge_count / self.schedule_count
@@ -1978,7 +2197,7 @@ class Scheduler(
     
     def _merge_adapter(self, lora_path: str) -> bool:
         """
-        Merge 指定的 LoRA adapter
+        Merge the specified LoRA adapter
         """
         if self.merged_adapter_path == lora_path:
             return True
@@ -1987,8 +2206,7 @@ class Scheduler(
             self._unmerge_adapter()
         
         try:
-            # 调用 worker 的 merge 方法
-            self. tp_worker.merge_lora_adapter(lora_path)
+            self.tp_worker.merge_lora_adapter(lora_path)
             self.merged_adapter_path = lora_path
             logger.info(f"[Scheduler] Successfully merged LoRA: {lora_path}")
             return True
@@ -1998,7 +2216,7 @@ class Scheduler(
     
     def _unmerge_adapter(self):
         """
-        Unmerge 当前的 LoRA adapter
+        Unmerge the currently merged LoRA adapter
         """
         if self.merged_adapter_path is None:
             return
@@ -2010,286 +2228,192 @@ class Scheduler(
         except Exception as e:
             logger. error(f"[Scheduler] Failed to unmerge LoRA:  {e}", exc_info=True)
     
-    # ========== 修改现有的 get_new_batch_prefill 方法 ==========
-    
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        """
-        修改后的 get_new_batch_prefill
-        
-        如果启用 credit scheduling，在调度前准备状态，调度后更新 credit
-        """
-        # Step 1: 准备 credit scheduling 状态
-        if self.enable_credit_schedule:
-            self._prepare_credit_schedule_state()
-        
-        # Step 2: 调用原有的 prefill 调度逻辑
-        batch = self._get_new_batch_prefill_impl()
-        
-        # Step 3: 完成 credit scheduling 后处理
-        if self.enable_credit_schedule and batch is not None:
-            self._finalize_credit_schedule_state(batch.reqs)
-        
-        return batch
-    
-    def _get_new_batch_prefill_impl(self) -> Optional[ScheduleBatch]:
-        """
-        原有的 get_new_batch_prefill 实现
-        
-        关键修改：在添加请求时使用 credit scheduling 过滤器
-        """
-        # Sort waiting queue based on policy
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        if self.try_preemption:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
+        # Handle the cases where prefill is not allowed
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked request has just been released.
+        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not self.chunked_req
+            and not self.try_preemption
+        ):
+            self.running_batch.batch_is_full = True
+            return None
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
+        # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
-        
-        # Get allocatable requests
-        num_running_reqs = len(self.running_batch.reqs)
-        num_allocatable = self.get_num_allocatable_reqs(num_running_reqs)
-        
-        if num_allocatable <= 0:
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            # If we are testing retraction and the running batch size exceeds
+            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
+            # in the waiting queue.
             return None
-        
-        # Create prefill adder
-        prefill_adder = PrefillAdder(
-            page_size=self.page_size,
-            tree_cache=self.tree_cache,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            running_batch=self.running_batch,
-            new_token_ratio=self.new_token_ratio,
-            rem_input_tokens=self.max_prefill_tokens,
-            rem_chunk_tokens=(
-                self.max_prefill_tokens 
-                if self.chunked_prefill_size is not None 
-                else None
-            ),
-            mixed_with_decode_tokens=0,
-            priority_scheduling_preemption_threshold=self.priority_scheduling_preemption_threshold,
+
+        # Prefill policy
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            self.running_batch,
+            self.new_token_ratio,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
         )
-        
-        # Add requests to prefill
-        has_inflight = len(self.running_batch.reqs) > 0
-        
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        if self.enable_lora:
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+
+        # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            # ===== Credit Scheduling 过滤器 =====
-            if not self._should_schedule_req_with_credit(req):
-                continue  # 跳过不符合 credit scheduling 策略的请求
-            # ===================================
-            
-            if not req.finished():
-                if self.chunked_prefill_size is None:
-                    res = prefill_adder.add_one_req(req, has_inflight)
-                else:
-                    res = prefill_adder.add_chunked_req(req)
-                
-                if res != AddReqResult.CONTINUE:
+
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_id for req in adder.can_run_list])
+                | set([req.lora_id])
+            ):
+                self.running_batch.batch_is_full = True
+                break
+
+            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                self.running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption:
                     break
-        
-        # Build batch
-        if prefill_adder.budget_state() == "has_inflight":
+                if not adder.preempt_to_schedule(req, self.server_args):
+                    break
+
+            if self.enable_hicache_storage:
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
+
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.running_batch.batch_is_full = len(
+                            adder.can_run_list
+                        ) > 0 or (not self.running_batch.is_empty())
+                    else:
+                        self.running_batch.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list: List[Req] = adder.can_run_list
+        if len(can_run_list) == 0:
             return None
-        
-        if len(prefill_adder.can_run_list) == 0:
-            return None
-        
-        # Remove scheduled requests from waiting queue
-        for req in prefill_adder.can_run_list:
-            if req in self.waiting_queue:
-                self.waiting_queue.remove(req)
-        
-        # Create batch
-        from sglang.srt. model_executor. forward_batch_info import ForwardMode
-        
-        new_batch = ScheduleBatch(
-            reqs=prefill_adder.can_run_list,
-            forward_mode=ForwardMode. EXTEND,
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.add_latency(RequestStage.PREFILL_WAITING)
+
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
+
+        # Print stats
+        if self.current_scheduler_metrics_enabled():
+            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                # Avoid update chunked request many times
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
         )
-        
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+
+        new_batch.prepare_for_extend()
+
+        # Mixed-style chunked prefill
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            )
+        else:
+            new_batch.decoding_reqs = None
+
         return new_batch
-    
-    # def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-    #     # Check if the grammar is ready in the grammar queue
-    #     if self.grammar_queue:
-    #         self.move_ready_grammar_requests()
-
-    #     if self.try_preemption:
-    #         # Reset batch_is_full to try preemption with a prefill adder.
-    #         self.running_batch.batch_is_full = False
-
-    #     # Handle the cases where prefill is not allowed
-    #     if (
-    #         self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-    #     ) and self.chunked_req is None:
-    #         return None
-
-    #     running_bs = len(self.running_batch.reqs)
-    #     # Ignore the check if self.chunked_req is not None.
-    #     # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-    #     # as the space for the chunked request has just been released.
-    #     # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-    #     # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
-    #     if (
-    #         self.get_num_allocatable_reqs(running_bs) <= 0
-    #         and not self.chunked_req
-    #         and not self.try_preemption
-    #     ):
-    #         self.running_batch.batch_is_full = True
-    #         return None
-
-    #     if self.enable_hierarchical_cache:
-    #         self.tree_cache.check_hicache_events()
-
-    #     # Get priority queue
-    #     self.policy.calc_priority(self.waiting_queue)
-
-    #     if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
-    #         # If we are testing retraction and the running batch size exceeds
-    #         # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
-    #         # in the waiting queue.
-    #         return None
-
-    #     # Prefill policy
-    #     adder = PrefillAdder(
-    #         self.page_size,
-    #         self.tree_cache,
-    #         self.token_to_kv_pool_allocator,
-    #         self.running_batch,
-    #         self.new_token_ratio,
-    #         self.max_prefill_tokens,
-    #         self.chunked_prefill_size,
-    #         running_bs if self.is_mixed_chunk else 0,
-    #         self.priority_scheduling_preemption_threshold,
-    #     )
-
-    #     if self.chunked_req is not None:
-    #         self.chunked_req.init_next_round_input()
-    #         self.chunked_req = adder.add_chunked_req(self.chunked_req)
-
-    #     if self.enable_lora:
-    #         lora_set = set([req.lora_id for req in self.running_batch.reqs])
-
-    #     # Get requests from the waiting queue to a new prefill batch
-    #     for req in self.waiting_queue:
-
-    #         if self.enable_lora and not self.tp_worker.can_run_lora_batch(
-    #             lora_set
-    #             | set([req.lora_id for req in adder.can_run_list])
-    #             | set([req.lora_id])
-    #         ):
-    #             self.running_batch.batch_is_full = True
-    #             break
-
-    #         running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
-    #         if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-    #             self.running_batch.batch_is_full = True
-    #         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-    #             # In prefill mode, prealloc queue and transfer queue can also take memory,
-    #             # so we need to check if the available size for the actual available size.
-    #             if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-    #                 self.running_batch.batch_is_full = True
-
-    #         if self.running_batch.batch_is_full:
-    #             if not self.try_preemption:
-    #                 break
-    #             if not adder.preempt_to_schedule(req, self.server_args):
-    #                 break
-
-    #         if self.enable_hicache_storage:
-    #             prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-    #             if not prefetch_done:
-    #                 # skip staging requests that are ongoing prefetch
-    #                 continue
-
-    #         req.init_next_round_input(self.tree_cache)
-    #         res = adder.add_one_req(
-    #             req,
-    #             has_chunked_req=(self.chunked_req is not None),
-    #             truncation_align_size=self.truncation_align_size,
-    #         )
-
-    #         if res != AddReqResult.CONTINUE:
-    #             if res == AddReqResult.NO_TOKEN:
-    #                 if self.enable_hierarchical_cache:
-    #                     # Set batch_is_full after making sure there are requests that can be served
-    #                     self.running_batch.batch_is_full = len(
-    #                         adder.can_run_list
-    #                     ) > 0 or (not self.running_batch.is_empty())
-    #                 else:
-    #                     self.running_batch.batch_is_full = True
-    #             break
-
-    #     # Update waiting queue
-    #     can_run_list: List[Req] = adder.can_run_list
-    #     if len(can_run_list) == 0:
-    #         return None
-
-    #     if self.enable_metrics:
-    #         # only record queue time when enable_metrics is True to avoid overhead
-    #         for req in can_run_list:
-    #             req.add_latency(RequestStage.PREFILL_WAITING)
-
-    #     self.waiting_queue = [
-    #         x for x in self.waiting_queue if x not in set(can_run_list)
-    #     ]
-    #     if adder.preempt_list:
-    #         for req in adder.preempt_list:
-    #             self._add_request_to_queue(req)
-
-    #     if adder.new_chunked_req is not None:
-    #         assert self.chunked_req is None
-    #         self.chunked_req = adder.new_chunked_req
-
-    #     if self.chunked_req:
-    #         self.chunked_req.is_chunked += 1
-
-    #     # Print stats
-    #     if self.current_scheduler_metrics_enabled():
-    #         self.log_prefill_stats(adder, can_run_list, running_bs, 0)
-
-    #     for req in can_run_list:
-    #         if req.time_stats.forward_entry_time == 0:
-    #             # Avoid update chunked request many times
-    #             req.time_stats.forward_entry_time = time.perf_counter()
-    #             if self.enable_metrics:
-    #                 self.metrics_collector.observe_queue_time(
-    #                     req.time_stats.get_queueing_time(),
-    #                 )
-
-    #     # Create a new batch
-    #     new_batch = ScheduleBatch.init_new(
-    #         can_run_list,
-    #         self.req_to_token_pool,
-    #         self.token_to_kv_pool_allocator,
-    #         self.tree_cache,
-    #         self.model_config,
-    #         self.enable_overlap,
-    #         self.spec_algorithm,
-    #         chunked_req=self.chunked_req,
-    #     )
-    #     if self.enable_hierarchical_cache:
-    #         # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-    #         new_batch.hicache_consumer_index = (
-    #             self.tree_cache.ready_to_load_host_cache()
-    #         )
-
-    #     new_batch.prepare_for_extend()
-
-    #     # Mixed-style chunked prefill
-    #     if (
-    #         self.is_mixed_chunk
-    #         and not self.running_batch.is_empty()
-    #         and not (new_batch.return_logprob or self.running_batch.return_logprob)
-    #     ):
-    #         # TODO (lianmin): support return_logprob + mixed chunked prefill
-    #         self.running_batch.filter_batch()
-    #         if not self.running_batch.is_empty():
-    #             self.running_batch.prepare_for_decode()
-    #             new_batch.mix_with_running(self.running_batch)
-    #             new_batch.decoding_reqs = self.running_batch.reqs
-    #         self.running_batch = ScheduleBatch(
-    #             reqs=[], batch_is_full=self.running_batch.batch_is_full
-    #         )
-    #     else:
-    #         new_batch.decoding_reqs = None
-
-    #     return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -2493,18 +2617,27 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # 如果当前 batch 处于 decode（自回归生成）阶段
         if batch.forward_mode.is_decode():
+            # 处理 decode 阶段的 batch 结果（如发送响应、释放资源等）
             self.process_batch_result_decode(batch, result)
+            # 记录 trace，标记 decode 循环阶段（用于性能分析和监控）
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
+        # 如果当前 batch 处于 prefill（输入填充）阶段
         elif batch.forward_mode.is_extend():
+            # 处理 prefill 阶段的 batch 结果
             self.process_batch_result_prefill(batch, result)
 
+        # 如果当前 batch 处于 idle（空闲）阶段
         elif batch.forward_mode.is_idle():
+            # 如果启用了 overlap（CPU/GPU 重叠调度）
             if self.enable_overlap:
+                # 如果结果有 copy_done（CUDA Event），等待数据拷贝完成
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
 
+        # 检查是否有健康检查请求需要回复，如果有则发送健康检查信号
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
@@ -3298,7 +3431,10 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
+    # 尝试从请求对象 recv_req 中获取属性 rid（请求的唯一标识符），如果没有则返回 None
     rid = getattr(recv_req, "rid", None)
+    # 判断 rid 是否存在且以 "HEALTH_CHECK" 开头
+    # 如果是，则说明这是一个健康检查请求，返回 True；否则返回 False
     return rid is not None and rid.startswith("HEALTH_CHECK")
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -561,14 +562,12 @@ class ServerArgs:
     decrypted_draft_config_file: Optional[str] = None
     
     # ===== Credit Scheduling 参数 =====
-    enable_credit_schedule: bool = False
     """Enable credit-based dynamic batching for LoRA adapters"""
-    
-    merge_threshold: float = 0.8
+    enable_credit_schedule: bool = False
     """Merge threshold for credit scheduling (0.5-1.0)"""
-    
-    credit_factor: float = 0.01
+    merge_threshold: float = 0.8
     """Credit adjustment factor"""
+    credit_factor: float = 0.01
 
     def __post_init__(self):
         """
@@ -3637,31 +3636,32 @@ class ServerArgs:
         )
         
         # Credit Scheduling group
-        group = parser.add_argument_group("Credit Scheduling Options (for LoRA)")
-        
-        group.add_argument(
-            "--enable-credit-schedule",
-            action="store_true",
-            help="Enable credit-based dynamic batching scheduling for LoRA adapters.  "
-                 "This enables dynamic merge/unmerge of LoRA adapters based on request patterns."
+        credit_group = parser.add_argument_group(
+            "Credit Scheduling Options",
+            "Options for credit-based dynamic batching (dLoRA algorithm)"
         )
         
-        group.add_argument(
+        credit_group.add_argument(
+            "--enable-credit-schedule",
+            action="store_true",
+            help="Enable credit-based dynamic batching for LoRA adapters.  "
+                 "This implements the dLoRA credit scheduling algorithm with dynamic merge/unmerge."
+        )
+        
+        credit_group.add_argument(
             "--merge-threshold",
             type=float,
             default=0.8,
-            help="Merge threshold for credit scheduling (default: 0.8). "
-                 "Valid range: [0.5, 1.0].  When a LoRA's request ratio exceeds this threshold, "
-                 "it will be considered for merging into base model."
+            help="Merge threshold for credit scheduling (default: 0.8, range: [0.5, 1.0]). "
+                 "When a LoRA's request ratio exceeds this threshold, it will be merged."
         )
         
-        group.add_argument(
+        credit_group.add_argument(
             "--credit-factor",
             type=float,
             default=0.01,
             help="Credit adjustment factor (default: 0.01). "
-                 "Controls how fast credits accumulate for skipped LoRAs. "
-                 "Higher values lead to faster fairness recovery."
+                 "Controls how fast credits accumulate for skipped LoRAs."
         )
 
     @classmethod
@@ -3670,6 +3670,16 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        
+        if getattr(args, "enable_credit_schedule", False):
+            if not (0.5 <= getattr(args, "merge_threshold", 0.8) <= 1.0):
+                raise ValueError(
+                    f"--merge-threshold must be in [0.5, 1.0], got {getattr(args, 'merge_threshold', 0.8)}"
+                )
+            if getattr(args, "credit_factor", 0.01) <= 0:
+                raise ValueError(
+                    f"--credit-factor must be positive, got {getattr(args, 'credit_factor', 0.01)}"
+                )
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})

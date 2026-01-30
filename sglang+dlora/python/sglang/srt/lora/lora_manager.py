@@ -228,31 +228,36 @@ class LoRAManager:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
+        # 1. 如果本批次的 LoRA 数量超过最大允许值，直接返回 False
         if len(lora_ids) > self.max_loras_per_batch:
             return False
 
-        # skip pinned LoRA check if no pinned LoRA adapters are loaded.
+        # 2. 如果当前没有任何 pinned LoRA（固定常驻内存的 LoRA），直接返回 True（所有 LoRA 都能加载）
         if self.num_pinned_loras == 0:
             return True
 
-        # counting the number of pinned LoRA adapters in the batch.
+        # 3. 统计本批次中 pinned LoRA 的数量
         pinned_loras_in_batch = 0
         for lora_id in lora_ids:
             if lora_id is not None:
-                lora_ref = self.lora_refs.get(lora_id)
+                lora_ref = self.lora_refs.get(lora_id)  # 获取 LoRA 的引用对象
                 assert (
                     lora_ref is not None
-                ), f"LoRA ID {lora_id} not found in lora_refs."
-                pinned_loras_in_batch += int(lora_ref.pinned)
+                ), f"LoRA ID {lora_id} not found in lora_refs."  # 检查 LoRA 是否存在
+                pinned_loras_in_batch += int(lora_ref.pinned)  # 若为 pinned，则计数加一
 
+        # 4. 检查 pinned LoRA 数量是否超过系统允许的最大 pinned 数量，若超过则报错（说明逻辑有 bug）
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
             f"Number of pinned LoRA adapters in the batch ({pinned_loras_in_batch}) exceeds the total number of pinned adapters "
             f"({self.num_pinned_loras}). This indicates a bug in the LoRA loading logic."
         )
 
+        # 5. 计算本批次需要新分配的 LoRA slot 数（非 pinned 的 LoRA 数量）
         required_slots = len(lora_ids) - pinned_loras_in_batch
+        # 6. 计算内存池中可用的 slot 数（总 slot - 已被 pinned 占用的 slot）
         mem_pool_vacancy = self.memory_pool.max_loras_per_batch - self.num_pinned_loras
 
+        # 7. 如果需要的新 slot 数小于等于可用 slot 数，返回 True，否则返回 False
         return required_slots <= mem_pool_vacancy
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
