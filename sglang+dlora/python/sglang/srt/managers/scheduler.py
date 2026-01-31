@@ -1974,12 +1974,12 @@ class Scheduler(
         self.enable_credit_schedule = True
         
         # Credit-related parameters
-        self.credit_factor = server_args.credit_factor  # default 0.01
-        self.merge_threshold = server_args.merge_threshold  # default 0.8
+        self.credit_factor = getattr(server_args, 'credit_factor', 0.01)
+        self.merge_threshold = getattr(server_args, 'merge_threshold', 0.8)
         
         # AIMD parameters
         self.aimd_add = 0.05
-        self.aimd_mul = 1.5
+        self.aimd_mul = 1.1
         
         # Threshold parameters
         self.credit_base = 0.0
@@ -1995,7 +1995,8 @@ class Scheduler(
         self.req_lora_cnt: Dict[Optional[str], int] = {}
         
         # LoRA adapters in GPU (up to max_loras_per_batch)
-        self.loras_in_gpu: List[Optional[str]] = [None] * server_args.max_loras_per_batch
+        max_loras = getattr(server_args, 'max_loras_per_batch', 4)
+        self.loras_in_gpu: List[Optional[str]] = [None] * max_loras
         
         # Currently active LoRA adapters
         self.active_loras: List[Optional[str]] = []
@@ -2018,15 +2019,16 @@ class Scheduler(
         self.merge_time = 0.1  # average time for merge operation
         self.unmerge_time = 0.05  # average time for unmerge operation
         self.switch_cost = 0.02  # switching cost
+        self.speed_rate = self.merge_time / self.unmerge_time
         
         # Credit scheduling mode cost
         self.credit_cost = self.credit_factor
-        self.batch_credit_cost = self.credit_factor * 2
+        self.batch_credit_cost = self.credit_factor / self.speed_rate
         
         # Initialize loaded lora's credit
-        if server_args.lora_paths:
+        if hasattr(server_args, 'lora_paths') and server_args.lora_paths:
             for lora_ref in server_args.lora_paths:
-                lora_path = lora_ref.lora_path if lora_ref.lora_path else None
+                lora_path = lora_ref.lora_path if hasattr(lora_ref, 'lora_path') else None
                 self.lora_credit[lora_path] = self.credit_base
                 self.req_lora_cnt[lora_path] = 0
         
@@ -2039,260 +2041,249 @@ class Scheduler(
             f"[Scheduler] Credit scheduling initialized: "
             f"credit_factor={self.credit_factor}, "
             f"merge_threshold={self.merge_threshold}, "
-            f"max_loras_per_batch={server_args.max_loras_per_batch}"
+            f"max_loras_per_batch={max_loras}"
         )
 
+
     def _get_new_batch_prefill_with_credit(self) -> Optional[ScheduleBatch]:
-        """Schedule a new prefill batch using credit scheduling strategy"""
+        """
+        Schedule a new prefill batch using credit scheduling strategy.
+        Fully adapted from dLoRA-artifact's _credit_schedule() method.
+        """
         
-        if not self.waiting_queue:
+        # ========== Step 1: Collect all pending requests ==========
+        # In dLoRA: queued = waiting + ready + swapped
+        # In SGLang: we primarily use waiting_queue, but should consider all pending
+        queued_reqs: List[Req] = []
+        queued_reqs.extend(self.waiting_queue)
+        
+        # Note: SGLang doesn't have explicit ready/swapped queues like vLLM
+        # If your implementation has similar concepts, add them here
+        # queued_reqs.extend(self.preempted_queue)  # If exists
+        
+        if not queued_reqs:
             return None
         
-        # 1. Analyze scheduling strategy
-        strategy, should_merge = self._analyze_credit_schedule_strategy()
+        # Sort by priority (equivalent to dLORA's policy.sort_by_priority)
+        self.policy.calc_priority(queued_reqs)
         
-        # 2. Select requests according to the strategy
-        if strategy == "batch":
-            # Batch mode: schedule a large batch of requests for a single LoRA
-            selected_reqs = self._schedule_batch_mode()
-            fcfs_reqs = self._get_fcfs_reqs()
-            
-        elif strategy == "credit":
-            # Credit mode: schedule requests for high-credit LoRAs
-            selected_reqs, fcfs_reqs = self._schedule_credit_mode()
-            
-        elif strategy == "mixed":
-            # Mixed mode: credit + FCFS
-            selected_reqs, fcfs_reqs = self._schedule_mixed_mode()
-            
-        else:  # "fcfs"
-            # FCFS mode: schedule in order
-            selected_reqs = self._get_fcfs_reqs()
-            fcfs_reqs = selected_reqs
-        
-        if not selected_reqs:
+        # ========== Step 2: Get FCFS baseline ==========
+        available_bs = self.max_running_requests - len(self.running_batch.reqs)
+        if available_bs <= 0:
             return None
         
-        # 3. Build batch (considering resource constraints)
-        batch = self._build_batch_from_reqs(selected_reqs)
+        scheduled_by_fcfs = queued_reqs[:available_bs]
+        
+        # ========== Step 3: Build lora_req_mapping ==========
+        lora_req_mapping: Dict[Optional[str], List[Req]] = {}
+        for req in queued_reqs:
+            lora_path = getattr(req, 'lora_path', None)
+            if lora_path not in lora_req_mapping:
+                lora_req_mapping[lora_path] = []
+            lora_req_mapping[lora_path].append(req)
+        
+        # Update req_lora_cnt
+        for lora_path, reqs in lora_req_mapping.items():
+            self.req_lora_cnt[lora_path] = len(reqs)
+        
+        # ========== Step 4: Try credit scheduling ==========
+        scheduled_by_credit = []
+        num_to_schedule = available_bs
+        
+        # Sort loras by credit (descending)
+        self.lora_credit = dict(sorted(
+            self.lora_credit.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ))
+        
+        credit_loras: List[Optional[str]] = []
+        
+        for lora_path in self.lora_credit.keys():
+            credit = self.lora_credit[lora_path]
+            
+            # Break if credit too low
+            if credit < self.credit_left_threshold:
+                break
+            
+            # Check if this lora qualifies for credit scheduling
+            if (credit >= self.credit_right_threshold or 
+                (lora_path in self.previous_credit_loras and 
+                credit >= self.credit_left_threshold)):
+                
+                num = min(num_to_schedule, len(lora_req_mapping.get(lora_path, [])))
+                scheduled_by_credit.extend(lora_req_mapping.get(lora_path, [])[:num])
+                credit_loras.append(lora_path)
+                num_to_schedule -= num
+                
+                if num_to_schedule == 0:
+                    break
+        
+        self.previous_credit_loras = credit_loras
+        
+        # ========== Step 5: Try batch mode (with all 3 branches) ==========
+        to_merge = False
+        scheduled = []
+        scheduled_by_batch = []
+        
+        if num_to_schedule == available_bs:  # Try batch mode
+            # Filter loras by credit_base
+            eligible_lora_mapping = {
+                lora: reqs for lora, reqs in lora_req_mapping.items()
+                if self.lora_credit.get(lora, 0) >= self.credit_base
+            }
+            
+            if not eligible_lora_mapping:
+                # No eligible loras, fall back to FCFS
+                scheduled = scheduled_by_fcfs
+            else:
+                # Sort by request count (descending)
+                sorted_lora_mapping = dict(sorted(
+                    eligible_lora_mapping.items(),
+                    key=lambda x: len(x[1]),
+                    reverse=True
+                ))
+                max_lora = list(sorted_lora_mapping.keys())[0]
+                max_num_lora_reqs = len(sorted_lora_mapping[max_lora])
+                
+                # ========== Branch 1: Continue with previous batch ==========
+                if (len(self.active_loras) == 1 and 
+                    self.active_loras[0] in sorted_lora_mapping and
+                    len(sorted_lora_mapping[self.active_loras[0]]) >= 
+                    self.merge_left_threshold * len(scheduled_by_fcfs)):
+                    
+                    assert self.merged == True or len(self.lora_credit) == 1
+                    to_merge = True
+                    self.num_iters += 1
+                    scheduled_by_batch = sorted_lora_mapping[self.active_loras[0]]
+                    scheduled = scheduled_by_batch
+                    self._adjust_credit_dlora_style(
+                        scheduled_by_fcfs, 
+                        scheduled, 
+                        self.batch_credit_cost
+                    )
+                
+                # ========== Branch 2: Create new batch ==========
+                elif max_num_lora_reqs >= self.merge_right_threshold * len(scheduled_by_fcfs):
+                    self._adjust_merge_threshold()
+                    to_merge = True
+                    self.merged = True
+                    self.num_iters = 1
+                    scheduled_by_batch = sorted_lora_mapping[max_lora][:available_bs]
+                    scheduled = scheduled_by_batch
+                    self.active_loras = [max_lora]
+                    if max_lora not in self.loras_in_gpu:
+                        self.loras_in_gpu[0] = max_lora
+                    self._adjust_credit_dlora_style(
+                        scheduled_by_fcfs, 
+                        scheduled, 
+                        self.batch_credit_cost
+                    )
+                
+                # ========== Branch 3: Give up batch, use FCFS ==========
+                else:
+                    # Track virtual switches for AIMD
+                    if self.max_lora != max_lora:
+                        self.virtual_switch_cnt += 1
+                        self.max_lora = max_lora
+                    scheduled_by_batch = sorted_lora_mapping[max_lora][:available_bs]
+                    scheduled = scheduled_by_fcfs  # ← Use FCFS
+                
+                # ========== Update statistics (for all branches) ==========
+                self.merge_batch_cnt += min(len(scheduled_by_batch), available_bs)
+                self.unmerge_batch_cnt += min(len(scheduled_by_fcfs), available_bs)
+        
+        # ========== Step 6: Credit-only mode ==========
+        elif num_to_schedule == 0:
+            scheduled = scheduled_by_credit
+            self._adjust_credit_dlora_style(
+                scheduled_by_fcfs, 
+                scheduled, 
+                self.credit_cost
+            )
+        
+        # ========== Step 7: Mixed mode (credit + FCFS) ==========
+        else:
+            scheduled = scheduled_by_credit.copy()
+            for req in scheduled_by_fcfs:
+                if req not in scheduled:
+                    scheduled.append(req)
+                    num_to_schedule -= 1
+                    if num_to_schedule == 0:
+                        break
+            self._adjust_credit_dlora_style(
+                scheduled_by_fcfs, 
+                scheduled, 
+                self.credit_cost
+            )
+        
+        # ========== Step 8: Apply capacity constraint (only in non-merge mode) ==========
+        if not to_merge:
+            # First, handle merge state transition
+            if self.merged:
+                self._adjust_merge_threshold()
+                self.merged = False
+                self.num_iters = 1
+            else:
+                self.num_iters += 1
+            
+            # Then, apply capacity constraint
+            lora_set = set()
+            lora_cnt = 0
+            scheduled_capacity = []
+            
+            for req in scheduled:
+                req_lora = getattr(req, 'lora_path', None)
+                if req_lora not in lora_set:
+                    if lora_cnt >= len(self.loras_in_gpu):
+                        continue  # Skip this request
+                    lora_set.add(req_lora)
+                    lora_cnt += 1
+                scheduled_capacity.append(req)
+            
+            scheduled = scheduled_capacity
+            
+            if not scheduled:
+                logger.warning(
+                    f"[Credit Schedule] All requests filtered by capacity constraint "
+                    f"(max_loras_per_batch={len(self.loras_in_gpu)})"
+                )
+                return None
+            
+            # Ensure constraint is satisfied
+            assert len(lora_set) <= len(self.loras_in_gpu), \
+                f"LoRA count {len(lora_set)} exceeds GPU slots {len(self.loras_in_gpu)}"
+            
+            # Update loras_in_gpu using LRU
+            self._update_loras_in_gpu_with_lru(lora_set)
+        
+        # ========== Step 9: Handle merge/unmerge ==========
+        if to_merge:
+            target_lora = self._get_dominant_lora(scheduled)
+            if target_lora != self.merged_lora:
+                self._merge_adapter(target_lora)
+        elif not to_merge and self.merged:
+            self._unmerge_adapter()
+        
+        # ========== Step 10: Build the actual batch ==========
+        batch = self._build_batch_from_selected_reqs(scheduled)
         
         if batch is None:
             return None
         
-        # 4. Update credit
-        self._update_credit_after_schedule(
-            scheduled_reqs=batch.reqs,
-            fcfs_reqs=fcfs_reqs,
-            fcfs_mode=(strategy == "fcfs")
+        logger.debug(
+            f"[Credit Schedule] Scheduled {len(batch.reqs)} requests, "
+            f"merge={to_merge}, active_loras={self.active_loras}"
         )
-        
-        # 5. Handle merge/unmerge
-        if should_merge and strategy == "batch":
-            target_lora = self._get_dominant_lora(batch.reqs)
-            if target_lora != self.merged_lora:
-                self._merge_adapter(target_lora)
-        elif not should_merge and self.merged:
-            self._unmerge_adapter()
-        
-        # 6. Update scheduling statistics
-        self._update_scheduling_stats(strategy, len(batch.reqs))
         
         return batch
 
-    def _analyze_credit_schedule_strategy(self) -> tuple[str, bool]:
-        """
-        Analyze which scheduling strategy should be used.
-        
-        Returns:
-            (strategy, should_merge): 
-                strategy: "fcfs", "credit", "mixed", "batch"
-                should_merge: whether to merge adapter
-        """
-        
-        # Count the number of requests for each lora
-        lora_req_count: Dict[Optional[str], int] = {}
-        for req in self.waiting_queue:
-            lora_path = getattr(req, 'lora_path', None)
-            lora_req_count[lora_path] = lora_req_count.get(lora_path, 0) + 1
-        
-        # Update req_lora_cnt
-        self.req_lora_cnt.update(lora_req_count)
-        
-        # Calculate available batch size (consider running requests)
-        available_bs = self.max_running_requests - len(self.running_batch.reqs)
-        if available_bs <= 0:
-            return "fcfs", False
-        
-        # Sort loras by credit
-        sorted_loras = sorted(
-            self.lora_credit.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        # Check if there are high credit loras
-        high_credit_loras = [
-            lora for lora, credit in sorted_loras
-            if credit >= self.credit_right_threshold
-            or (lora in self.previous_credit_loras and credit >= self.credit_left_threshold)
-        ]
-        
-        if high_credit_loras:
-            # If there are high credit loras, use credit or mixed mode
-            total_high_credit_reqs = sum(
-                lora_req_count.get(lora, 0) for lora in high_credit_loras
-            )
-            
-            if total_high_credit_reqs >= available_bs:
-                return "credit", False
-            else:
-                return "mixed", False
-        
-        # Check if batch mode can be used
-        # Find the lora with the most requests
-        if not lora_req_count:
-            return "fcfs", False
-        
-        max_lora = max(lora_req_count.items(), key=lambda x: x[1])
-        max_lora_path, max_lora_count = max_lora
-        
-        # Check if the lora's credit is sufficient
-        if self.lora_credit.get(max_lora_path, 0) < self.credit_base:
-            return "fcfs", False
-        
-        # Calculate batch threshold
-        fcfs_count = min(available_bs, len(self.waiting_queue))
-        
-        # Determine whether to use the currently merged adapter
-        if (self.merged and 
-            self.merged_lora in lora_req_count and
-            lora_req_count[self.merged_lora] >= self.merge_left_threshold * fcfs_count):
-            self.num_iters += 1
-            return "batch", True  # to_merge = True
-        
-        # Determine whether to merge a new adapter
-        if max_lora_count >= self.merge_right_threshold * fcfs_count:
-            if self.merged:
-                # Switching from old merge to new merge
-                self._adjust_merge_threshold()
-            
-            self.merged = True
-            self.num_iters = 1
-            return "batch", True  # to_merge = True
-        
-        # Record virtual switch (for threshold adjustment)
-        if self.max_lora != max_lora_path:
-            self.virtual_switch_cnt += 1
-            self.max_lora = max_lora_path
-        
-        # This corresponds to the "else: use fcfs" branch in dLoRA
-        if self.merged:
-            # We're transitioning out of merge mode
-            # (will be handled in _update_scheduling_stats)
-            pass
-        else:
-            # Continue in non-merge mode
-            self.num_iters += 1
-        
-        return "fcfs", False  # to_merge = False
-
-    def _schedule_batch_mode(self) -> List[Req]:
-        """Batch mode: schedule a large batch of requests for a single LoRA"""
-        
-        # Find the lora with the most requests
-        lora_req_count: Dict[Optional[str], int] = {}
-        for req in self.waiting_queue:
-            lora_path = getattr(req, 'lora_path', None)
-            lora_req_count[lora_path] = lora_req_count.get(lora_path, 0) + 1
-        
-        if self.merged and self.merged_lora in lora_req_count:
-            # Use the already merged adapter
-            target_lora = self.merged_lora
-        else:
-            # Use the lora with the most requests
-            if not lora_req_count:
-                return []
-            target_lora = max(lora_req_count.items(), key=lambda x: x[1])[0]
-        
-        # Collect all requests for this lora
-        selected_reqs = []
-        for req in self.waiting_queue:
-            req_lora = getattr(req, 'lora_path', None)
-            if req_lora == target_lora:
-                selected_reqs.append(req)
-        
-        # Update active loras
-        self.active_loras = [target_lora]
-        if target_lora not in self.loras_in_gpu:
-            self.loras_in_gpu[0] = target_lora
-        
-        return selected_reqs
-
-    def _schedule_credit_mode(self) -> tuple[List[Req], List[Req]]:
-        """Credit mode: schedule requests for high-credit LoRAs"""
-        
-        # Find high credit loras
-        high_credit_loras = []
-        for lora, credit in sorted(
-            self.lora_credit.items(),
-            key=lambda x: x[1],
-            reverse=True
-        ):
-            if credit >= self.credit_right_threshold:
-                high_credit_loras.append(lora)
-            elif (lora in self.previous_credit_loras and 
-                credit >= self.credit_left_threshold):
-                high_credit_loras.append(lora)
-            elif credit < self.credit_left_threshold:
-                break
-        
-        self.previous_credit_loras = high_credit_loras.copy()
-        
-        # Collect requests for these loras
-        selected_reqs = []
-        available_bs = self.max_running_requests - len(self.running_batch.reqs)
-        
-        for req in self.waiting_queue:
-            if len(selected_reqs) >= available_bs:
-                break
-            req_lora = getattr(req, 'lora_path', None)
-            if req_lora in high_credit_loras:
-                selected_reqs.append(req)
-        
-        # Get FCFS-ordered requests (for credit adjustment)
-        fcfs_reqs = self.waiting_queue[:available_bs]
-        
-        return selected_reqs, fcfs_reqs
-
-    def _schedule_mixed_mode(self) -> tuple[List[Req], List[Req]]:
-        """Mixed mode: credit + FCFS"""
-        
-        # First schedule by credit
-        credit_reqs, fcfs_reqs = self._schedule_credit_mode()
-        
-        # Supplement with FCFS requests
-        available_bs = self.max_running_requests - len(self.running_batch.reqs)
-        selected_reqs = credit_reqs.copy()
-        
-        for req in self.waiting_queue:
-            if len(selected_reqs) >= available_bs:
-                break
-            if req not in selected_reqs:
-                selected_reqs.append(req)
-        
-        return selected_reqs, fcfs_reqs
-
-    def _get_fcfs_reqs(self) -> List[Req]:
-        """
-        Get requests in FCFS order up to available batch size
-        """
-        available_bs = self.max_running_requests - len(self.running_batch.reqs)
-        return self.waiting_queue[:available_bs]
 
     def _build_batch_from_reqs(self, selected_reqs: List[Req]) -> Optional[ScheduleBatch]:
         """
-        Build a batch from selected requests (considering resource constraints).
-        Uses a dedicated function instead of reusing _get_new_batch_prefill_original.
+        Build a batch from selected requests.
+        Note: Capacity constraint has been moved to _get_new_batch_prefill_with_credit.
+        This method only handles LoRA validation and batch building.
         """
         
         if not selected_reqs:
@@ -2304,60 +2295,19 @@ class Scheduler(
             lora_path = getattr(req, 'lora_path', None)
             if lora_path is not None:
                 lora_paths.add(lora_path)
-                
-        # Only apply capacity constraint in non-merge mode
-        if not self.merged:
-            # Apply capacity constraint: limit concurrent LoRAs
-            filtered_reqs = []
-            lora_set = set()
-            lora_cnt = 0
-            
-            for req in selected_reqs:
-                req_lora = getattr(req, 'lora_path', None)
-                
-                # Check if this is a new LoRA
-                if req_lora not in lora_set:
-                    # Check if we've reached GPU capacity
-                    if lora_cnt >= self.server_args.max_loras_per_batch:
-                        # Skip this request (and implicitly all subsequent requests with same LoRA)
-                        continue
-                    lora_set.add(req_lora)
-                    lora_cnt += 1
-                
-                filtered_reqs.append(req)
-            
-            selected_reqs = filtered_reqs
-            lora_paths = lora_set
-            
-            if not selected_reqs:
-                logger.warning(
-                    f"[Credit Schedule] All requests filtered by capacity constraint "
-                    f"(max_loras_per_batch={self.server_args.max_loras_per_batch})"
-                )
-                return None
-        
-        # Ensure we don't exceed the LoRA slots
-        assert len(lora_set) <= len(self.loras_in_gpu), \
-            f"LoRA count {len(lora_set)} exceeds GPU slots {len(self.loras_in_gpu)}"
-        
-        # Update loras_in_gpu using LRU strategy (like dLoRA's models_in_gpu)
-        self._update_loras_in_gpu_with_lru(lora_set)
         
         # Check if the lora batch can run
         if lora_paths and not self.tp_worker.can_run_lora_batch(list(lora_paths)):
             logger.warning(
-                f"LoRA batch validation failed for paths: {lora_paths}. "
-                f"Falling back to FCFS."
+                f"LoRA batch validation failed for paths: {lora_paths}."
             )
             return None
-        
-        # Update loras in GPU
-        self._update_loras_in_gpu(lora_paths)
         
         # Build batch using dedicated function
         batch = self._build_batch_from_selected_reqs(selected_reqs)
         
         return batch
+
 
     def _build_batch_from_selected_reqs(self, selected_reqs: List[Req]) -> Optional[ScheduleBatch]:
         """
@@ -2494,9 +2444,10 @@ class Scheduler(
         
         return new_batch
 
+
     def _update_loras_in_gpu_with_lru(self, active_lora_set: set):
         """
-        Update loras_in_gpu using LRU strategy (adapted from dLoRA's logic)
+        Update loras_in_gpu using LRU strategy (adapted from dLoRA's logic).
         
         Args:
             active_lora_set: Set of LoRAs that need to be active
@@ -2507,7 +2458,6 @@ class Scheduler(
             return
         
         # Sort loras_in_gpu by request count (LRU: least requested first)
-        # This is analogous to dLoRA's sorting by req_model_cnt
         sorted_gpu_loras = sorted(
             enumerate(self.loras_in_gpu),
             key=lambda x: self.req_lora_cnt.get(x[1], -1) if x[1] is not None else -1
@@ -2533,7 +2483,7 @@ class Scheduler(
                     )
                     insertion_idx += 1
         
-        # Sort loras_in_gpu for consistency (like dLoRA does)
+        # Sort loras_in_gpu for consistency
         self.loras_in_gpu = sorted(self.loras_in_gpu, key=lambda x: (x is None, x))
         
         # Update active loras
@@ -2544,67 +2494,41 @@ class Scheduler(
             f"Active: {self.active_loras}"
         )
 
-    def _update_credit_after_schedule(
-        self,
-        scheduled_reqs: List[Req],
-        fcfs_reqs: List[Req],
-        fcfs_mode: bool
-    ):
-        """
-        Update credit after scheduling (dLoRA style)
-        
-        Args:
-            scheduled_reqs: List of actually scheduled requests
-            fcfs_reqs: List of requests in FCFS order
-            fcfs_mode: Whether FCFS mode is used
-        """
-        
-        if fcfs_mode:
-            return
-        
-        # Decide which cost to use
-        scheduled_loras = [getattr(req, 'lora_path', None) for req in scheduled_reqs]
-        if len(set(scheduled_loras)) == 1 and len(scheduled_reqs) == len(fcfs_reqs):
-            credit_cost = self.batch_credit_cost
-        else:
-            credit_cost = self.credit_cost
-        
-        # Call dLoRA-style adjust_credit
-        self._adjust_credit_dlora_style(
-            scheduled_reqs=scheduled_reqs,
-            fcfs_reqs=fcfs_reqs,
-            credit_cost=credit_cost
-        )
 
     def _adjust_credit_dlora_style(
         self,
-        scheduled_reqs: List[Req],
-        fcfs_reqs: List[Req],
+        scheduled_by_fcfs: List[Req],
+        scheduled: List[Req],
         credit_cost: float
     ):
         """
-        dLoRA-style credit adjustment: precise matching based on request position
+        dLoRA-style credit adjustment: precise matching based on request position.
         
         Core idea:
         1. If lengths are equal: compare position by position, transfer credit one-to-one
         2. If lengths are not equal (batch mode): skipped requests get compensation
+        
+        Args:
+            scheduled_by_fcfs: List of requests in FCFS order
+            scheduled: List of actually scheduled requests
+            credit_cost: Cost per credit adjustment
         """
         
-        if len(scheduled_reqs) == len(fcfs_reqs):
+        # Sort scheduled to ensure FCFS requests come first
+        scheduled_sorted = sorted(
+            scheduled, 
+            key=lambda x: x in scheduled_by_fcfs, 
+            reverse=True
+        )
+        
+        if len(scheduled_by_fcfs) == len(scheduled):
             # Case 1: Equal length → position-wise matching
-            # Sort to ensure FCFS requests come first
-            scheduled_reqs_sorted = sorted(
-                scheduled_reqs, 
-                key=lambda x: x in fcfs_reqs, 
-                reverse=True
-            )
-            
-            for sched_req, fcfs_req in zip(scheduled_reqs_sorted, fcfs_reqs):
+            for sched_req, fcfs_req in zip(scheduled_sorted, scheduled_by_fcfs):
                 sched_lora = getattr(sched_req, 'lora_path', None)
                 fcfs_lora = getattr(fcfs_req, 'lora_path', None)
                 
                 # If the scheduled request is not in FCFS (jumped ahead)
-                if sched_req not in fcfs_reqs:
+                if sched_req not in scheduled_by_fcfs:
                     # Penalize the jumper, reward the one who was jumped
                     if sched_lora in self.lora_credit:
                         self.lora_credit[sched_lora] -= credit_cost
@@ -2618,11 +2542,14 @@ class Scheduler(
         
         else:
             # Case 2: Unequal length → Batch mode (one LoRA dominates)
-            # Find requests in FCFS that are not scheduled (skipped by batch)
-            scheduled_set = set(scheduled_reqs)
-            dominant_lora = getattr(scheduled_reqs[0], 'lora_path', None)
+            assert credit_cost == self.batch_credit_cost, \
+                f"Expected batch_credit_cost, got {credit_cost}"
             
-            for fcfs_req in fcfs_reqs:
+            # Find requests in FCFS that are not scheduled (skipped by batch)
+            scheduled_set = set(scheduled)
+            dominant_lora = getattr(scheduled[0], 'lora_path', None)
+            
+            for fcfs_req in scheduled_by_fcfs:
                 if fcfs_req not in scheduled_set:
                     fcfs_lora = getattr(fcfs_req, 'lora_path', None)
                     
@@ -2636,6 +2563,7 @@ class Scheduler(
                         f"[Credit] Batch skip: {dominant_lora} batch skipped {fcfs_lora}, "
                         f"credit_cost={credit_cost/2:.4f}"
                     )
+
 
     def _adjust_merge_threshold(self):
         """Adjust merge threshold using AIMD algorithm"""
@@ -2661,13 +2589,13 @@ class Scheduler(
             if (tput_merge > tput_unmerge and 
                 self.merge_right_threshold - self.aimd_add > self.merge_left_threshold):
                 self.merge_right_threshold -= self.aimd_add
-                logger.debug(
+                logger.info(
                     f"[Credit Schedule] Decrease merge_right_threshold to {self.merge_right_threshold:.3f} "
                     f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
                 )
             elif tput_merge < tput_unmerge:
                 self.merge_right_threshold *= self.aimd_mul
-                logger.debug(
+                logger.info(
                     f"[Credit Schedule] Increase merge_right_threshold to {self.merge_right_threshold:.3f} "
                     f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
                 )
@@ -2675,13 +2603,13 @@ class Scheduler(
             if (tput_unmerge > tput_merge and 
                 self.merge_left_threshold + self.aimd_add < self.merge_right_threshold):
                 self.merge_left_threshold += self.aimd_add
-                logger.debug(
+                logger.info(
                     f"[Credit Schedule] Increase merge_left_threshold to {self.merge_left_threshold:.3f} "
                     f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
                 )
             elif tput_unmerge < tput_merge:
                 self.merge_left_threshold /= self.aimd_mul
-                logger.debug(
+                logger.info(
                     f"[Credit Schedule] Decrease merge_left_threshold to {self.merge_left_threshold:.3f} "
                     f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
                 )
@@ -2692,34 +2620,13 @@ class Scheduler(
         self.virtual_switch_cnt = 0
         self.max_lora = None
 
-    def _update_scheduling_stats(self, strategy: str, num_scheduled: int):
-        """
-        Update scheduling statistics (adapted from dLoRA)
-        """
-        
-        if strategy == "batch":
-            self.merge_batch_cnt += num_scheduled
-        else:
-            self.unmerge_batch_cnt += num_scheduled
-        
-        # This corresponds to dLoRA's "if not to_merge" block
-        should_merge = (strategy == "batch")
-        
-        if not should_merge and self.merged:
-            # Transitioning from merge to non-merge mode
-            self._adjust_merge_threshold()
-            self.merged = False
-            self.num_iters = 1
-            
-            logger.info(
-                f"[Credit Schedule] Exited merge mode, "
-                f"reset thresholds (left={self.merge_left_threshold:.3f}, "
-                f"right={self.merge_right_threshold:.3f})"
-            )
 
     def _merge_adapter(self, lora_path: str) -> bool:
         """
         Merge the specified LoRA adapter
+        
+        Args:
+            lora_path: Path to the LoRA adapter to merge
         
         Returns:
             Whether the merge was successful
@@ -2729,7 +2636,10 @@ class Scheduler(
         
         try:
             # Call the merge method of tp_worker
-            self.tp_worker.merge_lora_adapter(lora_path)
+            # Note: Actual implementation depends on your tp_worker interface
+            if hasattr(self.tp_worker, 'merge_lora_adapter'):
+                self.tp_worker.merge_lora_adapter(lora_path)
+            
             self.merged_lora = lora_path
             self.merged = True
             
@@ -2740,6 +2650,7 @@ class Scheduler(
             logger.error(f"[Scheduler] Failed to merge LoRA adapter {lora_path}: {e}")
             return False
 
+
     def _unmerge_adapter(self):
         """Unmerge the current LoRA adapter"""
         
@@ -2748,17 +2659,29 @@ class Scheduler(
         
         try:
             # Call the unmerge method of tp_worker
-            self.tp_worker.unmerge_lora_adapter()
+            # Note: Actual implementation depends on your tp_worker interface
+            if hasattr(self.tp_worker, 'unmerge_lora_adapter'):
+                self.tp_worker.unmerge_lora_adapter()
+            
+            logger.info(f"[Scheduler] Unmerged LoRA adapter: {self.merged_lora}")
+            
             self.merged_lora = None
             self.merged = False
-            
-            logger.info("[Scheduler] Unmerged LoRA adapter")
             
         except Exception as e:
             logger.error(f"[Scheduler] Failed to unmerge LoRA adapter: {e}")
 
+
     def _get_dominant_lora(self, reqs: List[Req]) -> Optional[str]:
-        """Get the dominant LoRA in the batch"""
+        """
+        Get the dominant LoRA in the batch
+        
+        Args:
+            reqs: List of requests
+        
+        Returns:
+            The LoRA path that appears most frequently
+        """
         
         lora_count = {}
         for req in reqs:
