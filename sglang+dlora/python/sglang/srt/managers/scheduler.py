@@ -1764,33 +1764,9 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _init_credit_scheduling(self, server_args:  ServerArgs):
-        """
-        Initialize credit-based scheduling for LoRA adapters.
-        """
-        self.enable_credit_schedule = server_args.enable_credit_schedule
-        
-        if not self.enable_credit_schedule:
-            return
-        
-        self.merge_threshold = server_args.merge_threshold
-        self. credit_factor = server_args. credit_factor
-        
-        # Credit tracking
-        self.lora_credits:  Dict[str, float] = defaultdict(float)
-        
-        # Statistics
-        self.merge_count = 0
-        self.schedule_count = 0
-        
-        # Current merged adapter
-        self.merged_adapter_path:  Optional[str] = None
-        
-        logger.info(
-            f"[Credit Schedule] Initialized:  threshold={self.merge_threshold:.2f}, "
-            f"factor={self.credit_factor:.4f}"
-        )
-    
+
+    # Credit-based scheduling algorithm
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]: 
         """
         Get a new prefill batch
@@ -1993,240 +1969,606 @@ class Scheduler(
 
         return new_batch
     
-    def _get_new_batch_prefill_with_credit(self) -> Optional[ScheduleBatch]: 
-        """
-        Credit-based prefill scheduling
+    def _init_credit_scheduling(self, server_args: ServerArgs):
+        """Initialize credit scheduling related variables"""
+        self.enable_credit_schedule = True
+        
+        # Credit-related parameters
+        self.credit_factor = server_args.credit_factor  # default 0.01
+        self.merge_threshold = server_args.merge_threshold  # default 0.8
+        
+        # AIMD parameters
+        self.aimd_add = 0.05
+        self.aimd_mul = 1.5
+        
+        # Threshold parameters
+        self.credit_base = 0.0
+        self.credit_left_threshold = 0.2
+        self.credit_right_threshold = 0.8
+        self.merge_left_threshold = self.merge_threshold - 0.1
+        self.merge_right_threshold = self.merge_threshold + 0.1
+        
+        # Credit dict: lora_path -> credit value
+        self.lora_credit: Dict[Optional[str], float] = {}
+        
+        # Request count: lora_path -> request count
+        self.req_lora_cnt: Dict[Optional[str], int] = {}
+        
+        # LoRA adapters in GPU (up to max_loras_per_batch)
+        self.loras_in_gpu: List[Optional[str]] = [None] * server_args.max_loras_per_batch
+        
+        # Currently active LoRA adapters
+        self.active_loras: List[Optional[str]] = []
+        
+        # Merge state
+        self.merged = False
+        self.merged_lora: Optional[str] = None
+        
+        # Performance statistics
+        self.num_iters = 0
+        self.merge_batch_cnt = 0
+        self.unmerge_batch_cnt = 0
+        self.virtual_switch_cnt = 0
+        self.max_lora: Optional[str] = None
+        
+        # Record last credit scheduling selected loras
+        self.previous_credit_loras: List[str] = []
+        
+        # Timing statistics (need actual measurement)
+        self.merge_time = 0.1  # average time for merge operation
+        self.unmerge_time = 0.05  # average time for unmerge operation
+        self.switch_cost = 0.02  # switching cost
+        
+        # Credit scheduling mode cost
+        self.credit_cost = self.credit_factor
+        self.batch_credit_cost = self.credit_factor * 2
+        
+        # Initialize loaded lora's credit
+        if server_args.lora_paths:
+            for lora_ref in server_args.lora_paths:
+                lora_path = lora_ref.lora_path if lora_ref.lora_path else None
+                self.lora_credit[lora_path] = self.credit_base
+                self.req_lora_cnt[lora_path] = 0
+        
+        # Ensure None (base model) is also in the dict
+        if None not in self.lora_credit:
+            self.lora_credit[None] = self.credit_base
+            self.req_lora_cnt[None] = 0
+        
+        logger.info(
+            f"[Scheduler] Credit scheduling initialized: "
+            f"credit_factor={self.credit_factor}, "
+            f"merge_threshold={self.merge_threshold}, "
+            f"max_loras_per_batch={server_args.max_loras_per_batch}"
+        )
 
-        Core logic:
-        1. Analyze the waiting_queue to determine the scheduling strategy
-        2. If filtering is needed (merge mode), temporarily replace the waiting_queue
-        3. Call the original prefill logic
-        4. Restore the waiting_queue and update credits
-        """
-        self.schedule_count += 1
+    def _get_new_batch_prefill_with_credit(self) -> Optional[ScheduleBatch]:
+        """Schedule a new prefill batch using credit scheduling strategy"""
         
-        # Step 1: analyze strategy
-        target_lora, should_merge = self._analyze_credit_schedule_strategy()
+        if not self.waiting_queue:
+            return None
         
-        if target_lora is None:
-            # FCFS mode: directly call original logic
-            batch = self._get_new_batch_prefill_original()
+        # 1. Analyze scheduling strategy
+        strategy, should_merge = self._analyze_credit_schedule_strategy()
+        
+        # 2. Select requests according to the strategy
+        if strategy == "batch":
+            # Batch mode: schedule a large batch of requests for a single LoRA
+            selected_reqs = self._schedule_batch_mode()
+            fcfs_reqs = self._get_fcfs_reqs()
             
-            if batch is not None:
-                self._update_credit_after_schedule(batch.reqs, fcfs_mode=True)
+        elif strategy == "credit":
+            # Credit mode: schedule requests for high-credit LoRAs
+            selected_reqs, fcfs_reqs = self._schedule_credit_mode()
             
-            return batch
-        
-        # Step 2: conduct merge if needed
-        if should_merge:
-            success = self._merge_adapter(target_lora)
-            if success:
-                self. merge_count += 1
-        
-        # Step 3: filter requests for the target LoRA
-        original_queue = list(self.waiting_queue)
-        filtered_queue = [
-            req for req in self.waiting_queue
-            if getattr(req, 'lora_path', None) == target_lora
-        ]
-        
-        if not filtered_queue:
-            return self._get_new_batch_prefill_original()
-        
-        # Step 4: filter waiting_queue
-        self.waiting_queue = filtered_queue
-        
-        try:
-            # Step 5: call original logic (will automatically remove scheduled requests from self.waiting_queue)
-            batch = self._get_new_batch_prefill_original()
+        elif strategy == "mixed":
+            # Mixed mode: credit + FCFS
+            selected_reqs, fcfs_reqs = self._schedule_mixed_mode()
             
-            # Step 6: restore waiting_queue
-            if batch is not None:
-                scheduled_reqs = set(batch.reqs)
-                self.waiting_queue = [
-                    req for req in original_queue
-                    if req not in scheduled_reqs
-                ]
+        else:  # "fcfs"
+            # FCFS mode: schedule in order
+            selected_reqs = self._get_fcfs_reqs()
+            fcfs_reqs = selected_reqs
+        
+        if not selected_reqs:
+            return None
+        
+        # 3. Build batch (considering resource constraints)
+        batch = self._build_batch_from_reqs(selected_reqs)
+        
+        if batch is None:
+            return None
+        
+        # 4. Update credit
+        self._update_credit_after_schedule(
+            scheduled_reqs=batch.reqs,
+            fcfs_reqs=fcfs_reqs,
+            fcfs_mode=(strategy == "fcfs")
+        )
+        
+        # 5. Handle merge/unmerge
+        if should_merge and strategy == "batch":
+            target_lora = self._get_dominant_lora(batch.reqs)
+            if target_lora != self.merged_lora:
+                self._merge_adapter(target_lora)
+        elif not should_merge and self.merged:
+            self._unmerge_adapter()
+        
+        # 6. Update scheduling statistics
+        self._update_scheduling_stats(strategy, len(batch.reqs))
+        
+        return batch
 
-                # Step 7: update credit
-                self._update_credit_after_schedule(batch.reqs, fcfs_mode=False)
-            else:
-                self.waiting_queue = original_queue
-            
-            return batch
-        
-        except Exception as e:
-            logger.error(f"[Credit Schedule] Error during scheduling: {e}", exc_info=True)
-            self.waiting_queue = original_queue
-            raise
-    
-    def _analyze_credit_schedule_strategy(self) -> tuple[Optional[str], bool]: 
+    def _analyze_credit_schedule_strategy(self) -> tuple[str, bool]:
         """
-        分析 waiting_queue，决定调度策略
+        Analyze which scheduling strategy should be used.
         
         Returns:
-            (target_lora, should_merge):
-                - target_lora:  目标 LoRA path，None 表示 FCFS 模式
-                - should_merge: 是否需要执行 merge 操作
+            (strategy, should_merge): 
+                strategy: "fcfs", "credit", "mixed", "batch"
+                should_merge: whether to merge adapter
         """
-        if not self.waiting_queue:
-            return None, False
         
-        # 统计各 LoRA 的请求数
-        lora_counts:  Dict[Optional[str], int] = defaultdict(int)
+        # Count the number of requests for each lora
+        lora_req_count: Dict[Optional[str], int] = {}
         for req in self.waiting_queue:
             lora_path = getattr(req, 'lora_path', None)
-            lora_counts[lora_path] += 1
+            lora_req_count[lora_path] = lora_req_count.get(lora_path, 0) + 1
         
-        total_reqs = len(self.waiting_queue)
+        # Update req_lora_cnt
+        self.req_lora_cnt.update(lora_req_count)
         
-        # Case 1: 如果当前有 merged adapter，检查是否保持 merge
-        if self.merged_adapter_path is not None:
-            merged_count = lora_counts. get(self.merged_adapter_path, 0)
-            
-            if merged_count > 0:
-                merge_ratio = merged_count / total_reqs
-                
-                if merge_ratio >= self.merge_threshold:
-                    # 保持 merge
-                    logger.debug(
-                        f"[Credit] Keep merge: {self.merged_adapter_path} "
-                        f"({merged_count}/{total_reqs}={merge_ratio:.2%})"
-                    )
-                    return self.merged_adapter_path, False  # 不需要重新 merge
-            
-            # Unmerge
-            logger.info(
-                f"[Credit] Unmerge {self.merged_adapter_path} "
-                f"(ratio={merged_count/total_reqs:.2%} < {self.merge_threshold:.2%})"
+        # Calculate available batch size (consider running requests)
+        available_bs = self.max_running_requests - len(self.running_batch.reqs)
+        if available_bs <= 0:
+            return "fcfs", False
+        
+        # Sort loras by credit
+        sorted_loras = sorted(
+            self.lora_credit.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        # Check if there are high credit loras
+        high_credit_loras = [
+            lora for lora, credit in sorted_loras
+            if credit >= self.credit_right_threshold
+            or (lora in self.previous_credit_loras and credit >= self.credit_left_threshold)
+        ]
+        
+        if high_credit_loras:
+            # If there are high credit loras, use credit or mixed mode
+            total_high_credit_reqs = sum(
+                lora_req_count.get(lora, 0) for lora in high_credit_loras
             )
-            self._unmerge_adapter()
-        
-        # Case 2: 检查是否应该 merge 某个 adapter
-        max_lora = None
-        max_count = 0
-        
-        for lora_path, count in lora_counts.items():
-            if lora_path is None:  # 跳过 base model
-                continue
-            if count > max_count:
-                max_lora = lora_path
-                max_count = count
-        
-        if max_lora and max_count / total_reqs >= self.merge_threshold:
-            lora_credit = self.lora_credits[max_lora]
             
-            if lora_credit <= 0.1:  # Credit threshold
-                # 应该 merge
-                logger.info(
-                    f"[Credit] Will merge {max_lora} "
-                    f"({max_count}/{total_reqs}={max_count/total_reqs:.2%}, credit={lora_credit:.4f})"
-                )
-                return max_lora, True  # 需要 merge
+            if total_high_credit_reqs >= available_bs:
+                return "credit", False
             else:
-                logger.debug(
-                    f"[Credit] Skip merge {max_lora}:  credit too high ({lora_credit:.4f})"
-                )
+                return "mixed", False
         
-        # Case 3: FCFS 模式
-        return None, False
-    
-    def _update_credit_after_schedule(self, scheduled_reqs: List, fcfs_mode: bool):
-        """
-        adjust credits after scheduling
-        """
-        # collect FCFS LoRA IDs
-        fcfs_lora_ids = set()
-        count = 0
-        for req in list(self.waiting_queue) + scheduled_reqs:
-            if count >= len(scheduled_reqs):
+        # Check if batch mode can be used
+        # Find the lora with the most requests
+        if not lora_req_count:
+            return "fcfs", False
+        
+        max_lora = max(lora_req_count.items(), key=lambda x: x[1])
+        max_lora_path, max_lora_count = max_lora
+        
+        # Check if the lora's credit is sufficient
+        if self.lora_credit.get(max_lora_path, 0) < self.credit_base:
+            return "fcfs", False
+        
+        # Calculate batch threshold
+        fcfs_count = min(available_bs, len(self.waiting_queue))
+        
+        # Determine whether to use the currently merged adapter
+        if (self.merged and 
+            self.merged_lora in lora_req_count and
+            lora_req_count[self.merged_lora] >= self.merge_left_threshold * fcfs_count):
+            self.num_iters += 1
+            return "batch", True
+        
+        # Determine whether to merge a new adapter
+        if max_lora_count >= self.merge_right_threshold * fcfs_count:
+            if self.merged:
+                self._adjust_merge_threshold()
+            self.merged = True
+            self.num_iters = 1
+            return "batch", True
+        
+        # Record virtual switch (for threshold adjustment)
+        if self.max_lora != max_lora_path:
+            self.virtual_switch_cnt += 1
+            self.max_lora = max_lora_path
+        
+        return "fcfs", False
+
+    def _schedule_batch_mode(self) -> List[Req]:
+        """Batch mode: schedule a large batch of requests for a single LoRA"""
+        
+        # Find the lora with the most requests
+        lora_req_count: Dict[Optional[str], int] = {}
+        for req in self.waiting_queue:
+            lora_path = getattr(req, 'lora_path', None)
+            lora_req_count[lora_path] = lora_req_count.get(lora_path, 0) + 1
+        
+        if self.merged and self.merged_lora in lora_req_count:
+            # Use the already merged adapter
+            target_lora = self.merged_lora
+        else:
+            # Use the lora with the most requests
+            if not lora_req_count:
+                return []
+            target_lora = max(lora_req_count.items(), key=lambda x: x[1])[0]
+        
+        # Collect all requests for this lora
+        selected_reqs = []
+        for req in self.waiting_queue:
+            req_lora = getattr(req, 'lora_path', None)
+            if req_lora == target_lora:
+                selected_reqs.append(req)
+        
+        # Update active loras
+        self.active_loras = [target_lora]
+        if target_lora not in self.loras_in_gpu:
+            self.loras_in_gpu[0] = target_lora
+        
+        return selected_reqs
+
+    def _schedule_credit_mode(self) -> tuple[List[Req], List[Req]]:
+        """Credit mode: schedule requests for high-credit LoRAs"""
+        
+        # Find high credit loras
+        high_credit_loras = []
+        for lora, credit in sorted(
+            self.lora_credit.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ):
+            if credit >= self.credit_right_threshold:
+                high_credit_loras.append(lora)
+            elif (lora in self.previous_credit_loras and 
+                credit >= self.credit_left_threshold):
+                high_credit_loras.append(lora)
+            elif credit < self.credit_left_threshold:
                 break
-            lora_path = getattr(req, 'lora_path', None)
-            if lora_path and lora_path != self.merged_adapter_path:
-                fcfs_lora_ids.add(lora_path)
-            count += 1
         
-        # collect scheduled LoRA IDs
-        scheduled_lora_ids = set()
-        for req in scheduled_reqs:
-            lora_path = getattr(req, 'lora_path', None)
-            if lora_path and lora_path != self.merged_adapter_path:
-                scheduled_lora_ids.add(lora_path)
+        self.previous_credit_loras = high_credit_loras.copy()
         
-        # adjust credit
-        skipped = fcfs_lora_ids - scheduled_lora_ids
-        for lora_path in skipped: 
-            self.lora_credits[lora_path] += self.credit_factor
-            logger.debug(
-                f"[Credit] Skipped {lora_path}: "
-                f"credit += {self.credit_factor:. 4f} -> {self.lora_credits[lora_path]:.4f}"
+        # Collect requests for these loras
+        selected_reqs = []
+        available_bs = self.max_running_requests - len(self.running_batch.reqs)
+        
+        for req in self.waiting_queue:
+            if len(selected_reqs) >= available_bs:
+                break
+            req_lora = getattr(req, 'lora_path', None)
+            if req_lora in high_credit_loras:
+                selected_reqs.append(req)
+        
+        # Get FCFS-ordered requests (for credit adjustment)
+        fcfs_reqs = self.waiting_queue[:available_bs]
+        
+        return selected_reqs, fcfs_reqs
+
+    def _schedule_mixed_mode(self) -> tuple[List[Req], List[Req]]:
+        """Mixed mode: credit + FCFS"""
+        
+        # First schedule by credit
+        credit_reqs, fcfs_reqs = self._schedule_credit_mode()
+        
+        # Supplement with FCFS requests
+        available_bs = self.max_running_requests - len(self.running_batch.reqs)
+        selected_reqs = credit_reqs.copy()
+        
+        for req in self.waiting_queue:
+            if len(selected_reqs) >= available_bs:
+                break
+            if req not in selected_reqs:
+                selected_reqs.append(req)
+        
+        return selected_reqs, fcfs_reqs
+
+    def _get_fcfs_reqs(self) -> List[Req]:
+        """
+        Get requests in FCFS order up to available batch size
+        """
+        available_bs = self.max_running_requests - len(self.running_batch.reqs)
+        return self.waiting_queue[:available_bs]
+
+
+    def _build_batch_from_reqs(self, selected_reqs: List[Req]) -> Optional[ScheduleBatch]:
+        """
+        Build a batch from selected requests (considering resource constraints).
+        This reuses SGLang's original resource checking logic.
+        """
+        
+        if not selected_reqs:
+            return None
+        
+        # Collect used lora paths
+        lora_paths = set()
+        for req in selected_reqs:
+            lora_path = getattr(req, 'lora_path', None)
+            if lora_path is not None:
+                lora_paths.add(lora_path)
+        
+        # Check if the lora batch can run
+        if lora_paths and not self.tp_worker.can_run_lora_batch(list(lora_paths)):
+            logger.warning(
+                f"LoRA batch validation failed for paths: {lora_paths}. "
+                f"Falling back to FCFS."
             )
+            return None
         
-        for lora_path in scheduled_lora_ids:
-            if lora_path in self.lora_credits:
-                old = self.lora_credits[lora_path]
-                self. lora_credits[lora_path] = max(0.0, old - self.credit_factor)
-                logger.debug(
-                    f"[Credit] Scheduled {lora_path}: "
-                    f"credit -= {self.credit_factor:.4f} -> {self.lora_credits[lora_path]:.4f}"
-                )
+        # Update loras in GPU
+        self._update_loras_in_gpu(lora_paths)
         
-        self._adjust_merge_threshold()
-    
-    def _adjust_merge_threshold(self):
-        """
-        Dynamically adjust the merge threshold based on recent merge ratio
-        """
-        if self.schedule_count >= 100: 
-            merge_ratio = self.merge_count / self.schedule_count
-            old = self.merge_threshold
-            
-            if merge_ratio > 0.5:
-                self.merge_threshold = min(0.95, self.merge_threshold + 0.05)
-            elif merge_ratio < 0.2:
-                self.merge_threshold = max(0.5, self.merge_threshold - 0.05)
-            
-            if old != self.merge_threshold:
-                logger.info(
-                    f"[Credit] Adjusted threshold:  {old:.2f} -> {self.merge_threshold:.2f} "
-                    f"(merge_ratio={merge_ratio:.2%})"
-                )
-            
-            self.merge_count = 0
-            self.schedule_count = 0
-    
-    def _merge_adapter(self, lora_path: str) -> bool:
-        """
-        Merge the specified LoRA adapter
-        """
-        if self.merged_adapter_path == lora_path:
-            return True
+        # Use SGLang's original logic to build the batch
+        # Here we need to call the original _get_new_batch_prefill_original method
+        # but only use selected_reqs
         
-        if self.merged_adapter_path is not None:
-            self._unmerge_adapter()
+        # Temporarily save the original waiting_queue
+        original_queue = self.waiting_queue
+        self.waiting_queue = selected_reqs
         
         try:
-            self.tp_worker.merge_lora_adapter(lora_path)
-            self.merged_adapter_path = lora_path
-            logger.info(f"[Scheduler] Successfully merged LoRA: {lora_path}")
+            batch = self._get_new_batch_prefill_original()
+        finally:
+            # Restore the original waiting_queue
+            self.waiting_queue = original_queue
+        
+        return batch
+
+
+    def _update_loras_in_gpu(self, required_loras: set):
+        """更新 GPU 中的 LoRA adapters"""
+        
+        if not required_loras:
+            self.active_loras = []
+            return
+        
+        # 按请求数排序 loras_in_gpu（LRU 策略）
+        sorted_gpu_loras = sorted(
+            self.loras_in_gpu,
+            key=lambda x: self.req_lora_cnt.get(x, 0) if x is not None else -1
+        )
+        
+        # 确保所有需要的 loras 都在 GPU 中
+        idx = 0
+        for lora in required_loras:
+            if lora not in self.loras_in_gpu:
+                # 替换掉使用最少的 lora
+                while idx < len(sorted_gpu_loras) and sorted_gpu_loras[idx] in required_loras:
+                    idx += 1
+                if idx < len(sorted_gpu_loras):
+                    self.loras_in_gpu[self.loras_in_gpu.index(sorted_gpu_loras[idx])] = lora
+                    idx += 1
+        
+        self.active_loras = sorted(list(required_loras))
+
+
+    def _update_credit_after_schedule(
+        self,
+        scheduled_reqs: List[Req],
+        fcfs_reqs: List[Req],
+        fcfs_mode: bool
+    ):
+        """
+        根据调度结果更新 credit
+        
+        Args:
+            scheduled_reqs: 实际调度的请求
+            fcfs_reqs: FCFS 顺序的请求（用于对比）
+            fcfs_mode: 是否使用 FCFS 模式
+        """
+        
+        if fcfs_mode:
+            # FCFS 模式不调整 credit
+            return
+        
+        # 提取 lora paths
+        scheduled_loras = [getattr(req, 'lora_path', None) for req in scheduled_reqs]
+        fcfs_loras = [getattr(req, 'lora_path', None) for req in fcfs_reqs]
+        
+        # 统计每个 lora 的请求数
+        scheduled_lora_count = {}
+        for lora in scheduled_loras:
+            scheduled_lora_count[lora] = scheduled_lora_count.get(lora, 0) + 1
+        
+        fcfs_lora_count = {}
+        for lora in fcfs_loras:
+            fcfs_lora_count[lora] = fcfs_lora_count.get(lora, 0) + 1
+        
+        # 决定使用哪个 cost
+        if len(set(scheduled_loras)) == 1 and len(scheduled_reqs) == len(fcfs_reqs):
+            # Batch 模式
+            credit_cost = self.batch_credit_cost
+        else:
+            # Credit/Mixed 模式
+            credit_cost = self.credit_cost
+        
+        # 调整 credit
+        self._adjust_credit(
+            scheduled_lora_count=scheduled_lora_count,
+            fcfs_lora_count=fcfs_lora_count,
+            credit_cost=credit_cost
+        )
+
+
+    def _adjust_credit(
+        self,
+        scheduled_lora_count: Dict[Optional[str], int],
+        fcfs_lora_count: Dict[Optional[str], int],
+        credit_cost: float
+    ):
+        """
+        调整 credit 值
+        
+        规则：
+        - 被调度但不在 FCFS 中的 lora：减少 credit
+        - 在 FCFS 中但未被调度的 lora：增加 credit
+        """
+        
+        # 找出被提前调度的 loras（不在 FCFS 前列）
+        penalized_loras = set()
+        rewarded_loras = set()
+        
+        # 简化版：比较调度数量
+        for lora in scheduled_lora_count:
+            fcfs_count = fcfs_lora_count.get(lora, 0)
+            scheduled_count = scheduled_lora_count[lora]
+            
+            if scheduled_count > fcfs_count:
+                # 这个 lora 获得了额外的调度机会
+                penalized_loras.add(lora)
+        
+        for lora in fcfs_lora_count:
+            scheduled_count = scheduled_lora_count.get(lora, 0)
+            fcfs_count = fcfs_lora_count[lora]
+            
+            if fcfs_count > scheduled_count:
+                # 这个 lora 失去了调度机会
+                rewarded_loras.add(lora)
+        
+        # 调整 credit
+        num_penalized = len(penalized_loras)
+        num_rewarded = len(rewarded_loras)
+        
+        if num_penalized > 0 and num_rewarded > 0:
+            penalty_per_lora = credit_cost / num_penalized
+            reward_per_lora = credit_cost / num_rewarded
+            
+            for lora in penalized_loras:
+                if lora in self.lora_credit:
+                    self.lora_credit[lora] -= penalty_per_lora
+            
+            for lora in rewarded_loras:
+                if lora in self.lora_credit:
+                    self.lora_credit[lora] += reward_per_lora
+
+
+    def _adjust_merge_threshold(self):
+        """使用 AIMD 算法调整 merge threshold"""
+        
+        if self.num_iters == 0:
+            return
+        
+        # 计算吞吐量
+        t_merge = self.merge_time * self.num_iters
+        t_unmerge = self.unmerge_time * self.num_iters
+        
+        if self.merged:
+            t_merge += self.switch_cost
+        else:
+            t_unmerge += self.switch_cost
+            t_merge += self.switch_cost * self.virtual_switch_cnt
+        
+        tput_merge = self.merge_batch_cnt / t_merge if t_merge > 0 else 0
+        tput_unmerge = self.unmerge_batch_cnt / t_unmerge if t_unmerge > 0 else 0
+        
+        # AIMD 调整
+        if self.merged:
+            if (tput_merge > tput_unmerge and 
+                self.merge_right_threshold - self.aimd_add > self.merge_left_threshold):
+                self.merge_right_threshold -= self.aimd_add
+                logger.debug(
+                    f"[Credit Schedule] Decrease merge_right_threshold to {self.merge_right_threshold:.3f} "
+                    f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
+                )
+            elif tput_merge < tput_unmerge:
+                self.merge_right_threshold *= self.aimd_mul
+                logger.debug(
+                    f"[Credit Schedule] Increase merge_right_threshold to {self.merge_right_threshold:.3f} "
+                    f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
+                )
+        else:
+            if (tput_unmerge > tput_merge and 
+                self.merge_left_threshold + self.aimd_add < self.merge_right_threshold):
+                self.merge_left_threshold += self.aimd_add
+                logger.debug(
+                    f"[Credit Schedule] Increase merge_left_threshold to {self.merge_left_threshold:.3f} "
+                    f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
+                )
+            elif tput_unmerge < tput_merge:
+                self.merge_left_threshold /= self.aimd_mul
+                logger.debug(
+                    f"[Credit Schedule] Decrease merge_left_threshold to {self.merge_left_threshold:.3f} "
+                    f"(tput_merge={tput_merge:.2f}, tput_unmerge={tput_unmerge:.2f})"
+                )
+        
+        # 重置统计
+        self.merge_batch_cnt = 0
+        self.unmerge_batch_cnt = 0
+        self.virtual_switch_cnt = 0
+        self.max_lora = None
+
+
+    def _update_scheduling_stats(self, strategy: str, num_scheduled: int):
+        """更新调度统计信息"""
+        
+        if strategy == "batch":
+            self.merge_batch_cnt += num_scheduled
+        else:
+            self.unmerge_batch_cnt += num_scheduled
+
+
+    def _merge_adapter(self, lora_path: str) -> bool:
+        """
+        Merge 指定的 LoRA adapter
+        
+        Returns:
+            是否成功 merge
+        """
+        if self.merged_lora == lora_path:
             return True
+        
+        try:
+            # 调用 tp_worker 的 merge 方法
+            self.tp_worker.merge_lora_adapter(lora_path)
+            self.merged_lora = lora_path
+            self.merged = True
+            
+            logger.info(f"[Scheduler] Merged LoRA adapter: {lora_path}")
+            return True
+            
         except Exception as e:
-            logger. error(f"[Scheduler] Failed to merge LoRA {lora_path}: {e}", exc_info=True)
+            logger.error(f"[Scheduler] Failed to merge LoRA adapter {lora_path}: {e}")
             return False
-    
+
+
     def _unmerge_adapter(self):
-        """
-        Unmerge the currently merged LoRA adapter
-        """
-        if self.merged_adapter_path is None:
+        """Unmerge 当前的 LoRA adapter"""
+        
+        if not self.merged:
             return
         
         try:
-            self. tp_worker.unmerge_lora_adapter()
-            logger.info(f"[Scheduler] Successfully unmerged LoRA: {self.merged_adapter_path}")
-            self.merged_adapter_path = None
+            # 调用 tp_worker 的 unmerge 方法
+            self.tp_worker.unmerge_lora_adapter()
+            self.merged_lora = None
+            self.merged = False
+            
+            logger.info("[Scheduler] Unmerged LoRA adapter")
+            
         except Exception as e:
-            logger. error(f"[Scheduler] Failed to unmerge LoRA:  {e}", exc_info=True)
+            logger.error(f"[Scheduler] Failed to unmerge LoRA adapter: {e}")
+
+
+    def _get_dominant_lora(self, reqs: List[Req]) -> Optional[str]:
+        """获取 batch 中占主导地位的 LoRA"""
+        
+        lora_count = {}
+        for req in reqs:
+            lora_path = getattr(req, 'lora_path', None)
+            lora_count[lora_path] = lora_count.get(lora_path, 0) + 1
+        
+        if not lora_count:
+            return None
+        
+        return max(lora_count.items(), key=lambda x: x[1])[0]
     
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
