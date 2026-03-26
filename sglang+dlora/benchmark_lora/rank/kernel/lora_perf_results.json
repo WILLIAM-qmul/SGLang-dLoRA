@@ -1,0 +1,1602 @@
+[
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 32,
+    "max_rank": 8,
+    "latency_ms": 0.1635327911376953
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 64,
+    "max_rank": 16,
+    "latency_ms": 0.16553983688354493
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 32,
+    "latency_ms": 0.16322559356689453
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 64,
+    "latency_ms": 0.1602764892578125
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 176,
+    "max_rank": 64,
+    "latency_ms": 0.16297983169555663
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 120,
+    "max_rank": 64,
+    "latency_ms": 0.16230400085449218
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 96,
+    "max_rank": 32,
+    "latency_ms": 0.16302080154418946
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 88,
+    "max_rank": 64,
+    "latency_ms": 0.15822848320007324
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 104,
+    "max_rank": 32,
+    "latency_ms": 0.16742399215698242
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.16275455474853515
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 88,
+    "max_rank": 32,
+    "latency_ms": 0.16099712371826172
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 64,
+    "max_rank": 32,
+    "latency_ms": 0.185163516998291
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 120,
+    "max_rank": 64,
+    "latency_ms": 0.16216064453125
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.16122047424316407
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 88,
+    "max_rank": 32,
+    "latency_ms": 0.16222208023071288
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 112,
+    "max_rank": 64,
+    "latency_ms": 0.16306175231933595
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.1614905548095703
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 64,
+    "max_rank": 32,
+    "latency_ms": 0.2028748893737793
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 120,
+    "max_rank": 64,
+    "latency_ms": 0.1941312026977539
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 176,
+    "max_rank": 64,
+    "latency_ms": 0.18782207489013672
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 64,
+    "max_rank": 8,
+    "latency_ms": 0.1927782440185547
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 16,
+    "latency_ms": 0.19449855804443358
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 32,
+    "latency_ms": 0.19183616638183593
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 64,
+    "latency_ms": 0.19860095977783204
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 160,
+    "max_rank": 32,
+    "latency_ms": 0.1987788772583008
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 200,
+    "max_rank": 64,
+    "latency_ms": 0.19705856323242188
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.19611648559570313
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 256,
+    "max_rank": 64,
+    "latency_ms": 0.19884031295776367
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 272,
+    "max_rank": 64,
+    "latency_ms": 0.1954489517211914
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 112,
+    "max_rank": 32,
+    "latency_ms": 0.1965875244140625
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 184,
+    "max_rank": 64,
+    "latency_ms": 0.19322879791259764
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 256,
+    "max_rank": 64,
+    "latency_ms": 0.2164326477050781
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 312,
+    "max_rank": 64,
+    "latency_ms": 0.19808767318725587
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 232,
+    "max_rank": 64,
+    "latency_ms": 0.19644416809082033
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 272,
+    "max_rank": 64,
+    "latency_ms": 0.19327360153198242
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 248,
+    "max_rank": 64,
+    "latency_ms": 0.1955251121520996
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 272,
+    "max_rank": 64,
+    "latency_ms": 0.19150848388671876
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 304,
+    "max_rank": 64,
+    "latency_ms": 0.19230783462524415
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 152,
+    "max_rank": 64,
+    "latency_ms": 0.19255296707153322
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.19181568145751954
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 8,
+    "latency_ms": 0.19290111541748048
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 16,
+    "latency_ms": 0.19560447692871094
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 32,
+    "latency_ms": 0.1784217643737793
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 1024,
+    "max_rank": 64,
+    "latency_ms": 0.22020095825195313
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 392,
+    "max_rank": 64,
+    "latency_ms": 0.16506879806518554
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 504,
+    "max_rank": 64,
+    "latency_ms": 0.19974143981933593
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 432,
+    "max_rank": 64,
+    "latency_ms": 0.1922457695007324
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 488,
+    "max_rank": 64,
+    "latency_ms": 0.1923072052001953
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 544,
+    "max_rank": 64,
+    "latency_ms": 0.19197952270507812
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 648,
+    "max_rank": 64,
+    "latency_ms": 0.18894847869873047
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 408,
+    "max_rank": 64,
+    "latency_ms": 0.18825216293334962
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 512,
+    "max_rank": 64,
+    "latency_ms": 0.19198207855224608
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 704,
+    "max_rank": 64,
+    "latency_ms": 0.19142911911010743
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 440,
+    "max_rank": 64,
+    "latency_ms": 0.19800128936767578
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 664,
+    "max_rank": 64,
+    "latency_ms": 0.1884979248046875
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 592,
+    "max_rank": 64,
+    "latency_ms": 0.19146751403808593
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 632,
+    "max_rank": 64,
+    "latency_ms": 0.1943756866455078
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 312,
+    "max_rank": 64,
+    "latency_ms": 0.19005439758300782
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 424,
+    "max_rank": 64,
+    "latency_ms": 0.18360319137573242
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 480,
+    "max_rank": 64,
+    "latency_ms": 0.1905049514770508
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 8,
+    "latency_ms": 0.1870848083496094
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 16,
+    "latency_ms": 0.19314687728881835
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 1024,
+    "max_rank": 32,
+    "latency_ms": 0.19554304122924804
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 2048,
+    "max_rank": 64,
+    "latency_ms": 0.2666086387634277
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 976,
+    "max_rank": 64,
+    "latency_ms": 0.20371456146240235
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1088,
+    "max_rank": 64,
+    "latency_ms": 0.20031488418579102
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 960,
+    "max_rank": 64,
+    "latency_ms": 0.19451904296875
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1280,
+    "max_rank": 64,
+    "latency_ms": 0.2186444854736328
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1112,
+    "max_rank": 64,
+    "latency_ms": 0.20040319442749024
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 904,
+    "max_rank": 64,
+    "latency_ms": 0.19935232162475586
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1136,
+    "max_rank": 64,
+    "latency_ms": 0.2008902359008789
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 880,
+    "max_rank": 64,
+    "latency_ms": 0.18905216217041015
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 968,
+    "max_rank": 64,
+    "latency_ms": 0.20133888244628906
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 960,
+    "max_rank": 64,
+    "latency_ms": 0.18911231994628908
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 736,
+    "max_rank": 64,
+    "latency_ms": 0.19453952789306642
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1112,
+    "max_rank": 64,
+    "latency_ms": 0.1990656089782715
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 976,
+    "max_rank": 64,
+    "latency_ms": 0.18788351058959962
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 896,
+    "max_rank": 64,
+    "latency_ms": 0.18931711196899415
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 952,
+    "max_rank": 64,
+    "latency_ms": 0.19001344680786134
+  },
+  {
+    "backend": "triton",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1096,
+    "max_rank": 64,
+    "latency_ms": 0.20420608520507813
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 32,
+    "max_rank": 8,
+    "latency_ms": 0.17154048919677733
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 64,
+    "max_rank": 16,
+    "latency_ms": 0.4414668655395508
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 32,
+    "latency_ms": 0.8412979125976563
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 64,
+    "latency_ms": 0.6821887969970704
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 72,
+    "max_rank": 32,
+    "latency_ms": 0.2739200019836426
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 80,
+    "max_rank": 32,
+    "latency_ms": 0.17694719314575194
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 104,
+    "max_rank": 64,
+    "latency_ms": 0.3699744033813477
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 192,
+    "max_rank": 64,
+    "latency_ms": 0.37384193420410156
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 152,
+    "max_rank": 64,
+    "latency_ms": 0.3822796630859375
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 136,
+    "max_rank": 64,
+    "latency_ms": 0.35948543548583983
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 136,
+    "max_rank": 64,
+    "latency_ms": 0.3279052734375
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 112,
+    "max_rank": 64,
+    "latency_ms": 0.18335744857788086
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 112,
+    "max_rank": 64,
+    "latency_ms": 0.1805721664428711
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 152,
+    "max_rank": 64,
+    "latency_ms": 0.17932287216186524
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 120,
+    "max_rank": 64,
+    "latency_ms": 0.18769920349121094
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 112,
+    "max_rank": 64,
+    "latency_ms": 0.16908416748046876
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 104,
+    "max_rank": 64,
+    "latency_ms": 0.14448639869689942
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 144,
+    "max_rank": 64,
+    "latency_ms": 0.18106367111206054
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 192,
+    "max_rank": 64,
+    "latency_ms": 0.17670143127441407
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 4,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 80,
+    "max_rank": 32,
+    "latency_ms": 0.18024448394775391
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 64,
+    "max_rank": 8,
+    "latency_ms": 0.18475839614868164
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 16,
+    "latency_ms": 0.38158336639404294
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 32,
+    "latency_ms": 0.37656574249267577
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 64,
+    "latency_ms": 0.3762995147705078
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 192,
+    "max_rank": 64,
+    "latency_ms": 0.3779174423217773
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 280,
+    "max_rank": 64,
+    "latency_ms": 0.3858848190307617
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 272,
+    "max_rank": 64,
+    "latency_ms": 0.221265926361084
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 336,
+    "max_rank": 64,
+    "latency_ms": 0.3701145553588867
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 192,
+    "max_rank": 64,
+    "latency_ms": 0.17500160217285157
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 280,
+    "max_rank": 64,
+    "latency_ms": 0.16984256744384765
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 288,
+    "max_rank": 64,
+    "latency_ms": 0.16976255416870117
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 152,
+    "max_rank": 32,
+    "latency_ms": 0.15286272048950195
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 272,
+    "max_rank": 64,
+    "latency_ms": 0.14958592414855956
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 184,
+    "max_rank": 64,
+    "latency_ms": 0.17475584030151367
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 216,
+    "max_rank": 64,
+    "latency_ms": 0.1405951976776123
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 216,
+    "max_rank": 64,
+    "latency_ms": 0.14066368103027344
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 184,
+    "max_rank": 64,
+    "latency_ms": 0.23373823165893554
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 304,
+    "max_rank": 64,
+    "latency_ms": 0.3729894256591797
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 152,
+    "max_rank": 32,
+    "latency_ms": 0.3781836700439453
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 8,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 280,
+    "max_rank": 64,
+    "latency_ms": 0.18085887908935547
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 128,
+    "max_rank": 8,
+    "latency_ms": 0.17860607147216798
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 16,
+    "latency_ms": 0.37697662353515626
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 32,
+    "latency_ms": 0.3836556625366211
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 1024,
+    "max_rank": 64,
+    "latency_ms": 0.3747244644165039
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 544,
+    "max_rank": 64,
+    "latency_ms": 0.3720601654052734
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 456,
+    "max_rank": 64,
+    "latency_ms": 0.37738494873046874
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 408,
+    "max_rank": 64,
+    "latency_ms": 0.3903315353393555
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 560,
+    "max_rank": 64,
+    "latency_ms": 0.23302143096923827
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 440,
+    "max_rank": 64,
+    "latency_ms": 0.17338367462158202
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 320,
+    "max_rank": 32,
+    "latency_ms": 0.37588993072509763
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 520,
+    "max_rank": 64,
+    "latency_ms": 0.36300800323486326
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 584,
+    "max_rank": 64,
+    "latency_ms": 0.37478401184082033
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 488,
+    "max_rank": 64,
+    "latency_ms": 0.3768320083618164
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 544,
+    "max_rank": 64,
+    "latency_ms": 0.3797196960449219
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 544,
+    "max_rank": 64,
+    "latency_ms": 0.3804159927368164
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 520,
+    "max_rank": 64,
+    "latency_ms": 0.37543937683105466
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 504,
+    "max_rank": 64,
+    "latency_ms": 0.37718017578125
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 544,
+    "max_rank": 64,
+    "latency_ms": 0.38141952514648436
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 480,
+    "max_rank": 64,
+    "latency_ms": 0.37926910400390623
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 16,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 560,
+    "max_rank": 64,
+    "latency_ms": 0.37552127838134763
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 256,
+    "max_rank": 8,
+    "latency_ms": 0.38377471923828127
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 512,
+    "max_rank": 16,
+    "latency_ms": 0.371855354309082
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 1024,
+    "max_rank": 32,
+    "latency_ms": 0.3718809509277344
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": false,
+    "sum_rank": 2048,
+    "max_rank": 64,
+    "latency_ms": 0.3748863983154297
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 960,
+    "max_rank": 64,
+    "latency_ms": 0.18545408248901368
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1056,
+    "max_rank": 64,
+    "latency_ms": 0.14110719680786132
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 776,
+    "max_rank": 64,
+    "latency_ms": 0.3820339202880859
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1192,
+    "max_rank": 64,
+    "latency_ms": 0.3711385726928711
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 936,
+    "max_rank": 64,
+    "latency_ms": 0.17780736923217774
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1128,
+    "max_rank": 64,
+    "latency_ms": 0.3690496063232422
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 776,
+    "max_rank": 64,
+    "latency_ms": 0.36812801361083985
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 968,
+    "max_rank": 64,
+    "latency_ms": 0.3801497650146484
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 864,
+    "max_rank": 64,
+    "latency_ms": 0.18993408203125
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1008,
+    "max_rank": 64,
+    "latency_ms": 0.17686527252197265
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1056,
+    "max_rank": 64,
+    "latency_ms": 0.1802854347229004
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1184,
+    "max_rank": 64,
+    "latency_ms": 0.1741823959350586
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1080,
+    "max_rank": 64,
+    "latency_ms": 0.3709337615966797
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 1072,
+    "max_rank": 64,
+    "latency_ms": 0.19769920349121095
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 992,
+    "max_rank": 64,
+    "latency_ms": 0.1880473518371582
+  },
+  {
+    "backend": "csgmv",
+    "mode": "decode",
+    "batch_size": 32,
+    "seq_len": 1,
+    "hetero": true,
+    "sum_rank": 968,
+    "max_rank": 64,
+    "latency_ms": 0.18328191757202147
+  }
+]

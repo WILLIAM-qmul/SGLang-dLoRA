@@ -1757,6 +1757,30 @@ class FetchReqsInput(BaseReq):
 class FetchReqsOutput(BaseReq):
     requests: List[Dict]
     success: bool = True
+    
+
+@dataclass
+class GetRankAwareStatsReqInput(BaseReq):
+    """
+    Sent by TokenizerManager → Scheduler.
+    Scheduler replies with running/waiting rank lists.
+    No fields needed; scheduler collects all data itself.
+    """
+    pass
+
+
+@dataclass
+class GetRankAwareStatsReqOutput(BaseReq):
+    """
+    Returned by Scheduler → TokenizerManager.
+
+    running_ranks : LoRA rank per request currently in running_batch.
+                    0 = base model (no LoRA).
+    waiting_ranks : LoRA rank per request in waiting_queue.
+                    0 = base model (no LoRA).
+    """
+    running_ranks: List[int] = field(default_factory=list)
+    waiting_ranks: List[int] = field(default_factory=list)
 
 
 def _check_all_req_types():

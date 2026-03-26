@@ -245,3 +245,40 @@ async def abort_requests(request: Request):
             {"error": str(e)},
             status_code=500
         )
+
+
+async def get_rank_aware_stats(request: Request):
+    """
+    GET /get_rank_aware_stats
+
+    Returns the LoRA rank of every request currently in the running batch
+    and waiting queue.  Used exclusively by RankAwareScheduler (Algorithm 1).
+
+    Response:
+    {
+        "running_ranks": [int, ...],   # one per running request (0 = base model)
+        "waiting_ranks": [int, ...],   # one per waiting request (0 = base model)
+        "num_running":   int,
+        "num_waiting":   int,
+        "timestamp":     float
+    }
+
+    Design rationale:
+    - Returns ONLY rank integers — no output_dim, no weight paths.
+    - Mirrors the existing pattern of get_migration_info / get_req_model_cnt.
+    - The instance_manager calls this concurrently on all candidate engines
+      before running CalcCost().
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        result = await tokenizer_manager.get_rank_aware_stats()
+        return JSONResponse({
+            "running_ranks": result.running_ranks,
+            "waiting_ranks": result.waiting_ranks,
+            "num_running":   len(result.running_ranks),
+            "num_waiting":   len(result.waiting_ranks),
+            "timestamp":     time.time(),
+        })
+    except Exception as e:
+        logger.error(f"Failed to get rank_aware_stats: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)

@@ -75,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     GetMigrationInfoReqOutput,
     FetchReqsInput,
     FetchReqsOutput,
+    GetRankAwareStatsReqInput,
+    GetRankAwareStatsReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -412,6 +414,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (GetReqModelCntReqOutput, self._handle_get_req_model_cnt_output),
                 (GetMigrationInfoReqOutput, self._handle_get_migration_info_output),
                 (FetchReqsOutput, self._handle_fetch_reqs_output),
+                (GetRankAwareStatsReqOutput, self._handle_get_rank_aware_stats_output),
             ]
         )
         self.init_communicators(server_args)
@@ -1355,6 +1358,25 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle fetched requests from scheduler."""
         if self.fetch_reqs_future and not self.fetch_reqs_future.done():
             self.fetch_reqs_future.set_result(recv_obj.requests)
+            
+    
+    async def get_rank_aware_stats(self) -> "GetRankAwareStatsReqOutput":
+        """
+        Request rank-aware stats from the scheduler (Algorithm 1).
+        Returns running_ranks and waiting_ranks as plain int lists.
+        This method is awaited by the HTTP endpoint.
+        """
+        self._rank_aware_stats_future: asyncio.Future = asyncio.Future()
+        self.send_to_scheduler.send_pyobj(GetRankAwareStatsReqInput())
+        return await self._rank_aware_stats_future
+
+    def _handle_get_rank_aware_stats_output(
+        self, recv_obj: "GetRankAwareStatsReqOutput"
+    ) -> None:
+        """Handle scheduler response for rank-aware stats request."""
+        fut = getattr(self, "_rank_aware_stats_future", None)
+        if fut is not None and not fut.done():
+            fut.set_result(recv_obj)
 
 
     def configure_logging(self, obj: ConfigureLoggingReq):

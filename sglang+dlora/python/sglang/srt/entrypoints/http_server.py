@@ -318,26 +318,30 @@ app.add_middleware(
 )
 
 
-from sglang.srt.entrypoints.http_server_extensions import (
-    get_instance_stats,
-    get_loaded_lora_adapters,
-    get_req_model_cnt,
-    get_migration_info,
-    fetch_seq_groups,
-    insert_seq_groups,
-    abort_requests as abort_requests_batch,
-)
+# from sglang.srt.entrypoints.http_server_extensions import (
+#     get_instance_stats,
+#     get_loaded_lora_adapters,
+#     get_req_model_cnt,
+#     get_migration_info,
+#     fetch_seq_groups,
+#     insert_seq_groups,
+#     abort_requests as abort_requests_batch,
+#     get_rank_aware_stats,
+# )
 
-# Instance manager endpoints
-app.add_api_route("/get_instance_stats", get_instance_stats, methods=["GET"])
-app.add_api_route("/get_loaded_lora_adapters", get_loaded_lora_adapters, methods=["GET"])
-app.add_api_route("/get_req_model_cnt", get_req_model_cnt, methods=["GET"])
-app.add_api_route("/get_migration_info", get_migration_info, methods=["GET"])
+# # Instance manager endpoints
+# app.add_api_route("/get_instance_stats", get_instance_stats, methods=["GET"])
+# app.add_api_route("/get_loaded_lora_adapters", get_loaded_lora_adapters, methods=["GET"])
+# app.add_api_route("/get_req_model_cnt", get_req_model_cnt, methods=["GET"])
+# app.add_api_route("/get_migration_info", get_migration_info, methods=["GET"])
 
-# Migration endpoints
-app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
-app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])
-app.add_api_route("/abort_requests", abort_requests_batch, methods=["POST"])
+# # Migration endpoints
+# app.add_api_route("/fetch_seq_groups", fetch_seq_groups, methods=["POST"])
+# app.add_api_route("/insert_seq_groups", insert_seq_groups, methods=["POST"])
+# app.add_api_route("/abort_requests", abort_requests_batch, methods=["POST"])
+
+# # Rank-aware scheduling endpoints
+# app.add_api_route("/get_rank_aware_stats", get_rank_aware_stats, methods=["GET"])
 
 
 @app.exception_handler(HTTPException)
@@ -593,6 +597,182 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             # 捕获异常，返回错误响应
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+        
+"""
+HTTP server extensions for instance manager integration. 
+"""
+
+from fastapi.responses import JSONResponse
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.sampling.sampling_params import SamplingParams
+
+@app.get("/get_instance_stats")
+async def get_instance_stats(request: Request):
+    """
+    Get current instance statistics for migration decision.
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    scheduler_stats = await tokenizer_manager.get_instance_stats()
+    stats = {
+        "lora_capacity": scheduler_stats.lora_capacity,
+        "available_gpu_memory": scheduler_stats.available_gpu_memory,
+        "num_free_gpu_pages": scheduler_stats.num_free_gpu_pages,
+        "cache_page_size": scheduler_stats.cache_page_size,
+    }
+    return JSONResponse(stats)
+
+@app.get("/get_loaded_lora_adapters")
+async def get_loaded_lora_adapters(request: Request):
+    """
+    Get currently loaded LoRA adapters from the LoRA registry.
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    loaded_adapters = {}
+    if hasattr(tokenizer_manager, 'lora_registry') and tokenizer_manager.lora_registry:
+        all_adapters = tokenizer_manager.lora_registry.get_all_adapters()
+        loaded_adapters = {
+            lora_ref.lora_name: lora_ref.lora_path
+            for lora_ref in all_adapters.values()
+        }
+    return JSONResponse({
+        "loaded_adapters": loaded_adapters,
+        "num_loaded": len(loaded_adapters)
+    })
+
+@app.get("/get_req_model_cnt")
+async def get_req_model_cnt(request: Request):
+    """
+    Get lightweight request model count statistics.
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        result = await tokenizer_manager.get_req_model_cnt()
+        return JSONResponse({
+            "req_model_cnt": result.req_model_cnt,
+            "total_requests": result.total_requests,
+            "exec_cost": result.exec_cost,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        logger.error(f"Failed to get req_model_cnt: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/get_migration_info")
+async def get_migration_info(request: Request):
+    """
+    Get migration information for instance manager.
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        result = await tokenizer_manager.get_migration_info()
+        return JSONResponse({
+            "req_metadata": result.req_metadata,
+            "model_exec_time": {
+                model_id: {"count": stats[0], "total_time": stats[1]}
+                for model_id, stats in result.model_exec_time.items()
+            },
+            "num_requests": result.num_requests,
+            "timestamp": time.time(),
+        })
+    except Exception as e:
+        logger.error(f"Failed to get migration info: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/fetch_seq_groups")
+async def fetch_seq_groups(request: Request):
+    """Endpoint to fetch request states for migration."""
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        data = await request.json()
+        request_ids = data.get("request_ids", [])
+        if not request_ids:
+            return JSONResponse({"seq_groups": []})
+        seq_groups = await tokenizer_manager.fetch_requests(request_ids)
+        return JSONResponse({"seq_groups": seq_groups})
+    except Exception as e:
+        logger.error(f"Failed to fetch seq_groups: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/insert_seq_groups")
+async def insert_seq_groups(request: Request):
+    """Endpoint to insert migrated requests (text-level resume via input_ids)."""
+    data = await request.json()
+    seq_groups = data.get("seq_groups", []) or []
+    accepted = 0
+    errors = []
+    for seq_data in seq_groups:
+        try:
+            rid = seq_data.get("rid")
+            input_ids = seq_data.get("input_ids")
+            sampling_params = seq_data.get("sampling_params")
+            lora_path = seq_data.get("lora_path")
+            if not rid:
+                raise ValueError("missing rid")
+            if not input_ids:
+                raise ValueError(f"missing input_ids for rid={rid}")
+            if sampling_params is None:
+                raise ValueError(f"missing sampling_params for rid={rid}")
+            init_params = inspect.signature(SamplingParams.__init__).parameters
+            valid_keys = set(init_params) - {'self'}
+            if 'stop_strs' in sampling_params:
+                valid_keys.add('stop_strs')
+            filtered_sampling_params = {k: v for k, v in sampling_params.items() if k in valid_keys}
+            if 'stop_strs' in filtered_sampling_params and 'stop' not in filtered_sampling_params:
+                filtered_sampling_params['stop'] = filtered_sampling_params.pop('stop_strs')
+            obj = GenerateReqInput(
+                rid=rid,
+                input_ids=input_ids,
+                sampling_params=filtered_sampling_params,
+                lora_path=lora_path,
+                stream=True,
+            )
+            async def _consume_generate_request(obj):
+                async for _ in _global_state.tokenizer_manager.generate_request(obj, None):
+                    break
+            asyncio.create_task(_consume_generate_request(obj))
+            accepted += 1
+        except Exception as e:
+            logger.error(f"Error inserting seq_group. Data: {seq_data}, Error: {e}", exc_info=True)
+            errors.append({"rid": seq_data.get("rid"), "error": str(e)})
+    return JSONResponse({"count": accepted, "errors": errors})
+
+@app.post("/abort_requests")
+async def abort_requests(request: Request):
+    """
+    Abort multiple requests.
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        body = await request.json()
+        request_ids = body.get("request_ids", [])
+        if not request_ids:
+            return JSONResponse({"aborted_count": 0})
+        for request_id in request_ids:
+            tokenizer_manager.abort_request(rid=request_id)
+        return JSONResponse({"aborted_count": len(request_ids)})
+    except Exception as e:
+        logger.error(f"Failed to abort requests: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/get_rank_aware_stats")
+async def get_rank_aware_stats(request: Request):
+    """
+    GET /get_rank_aware_stats
+    """
+    tokenizer_manager = _global_state.tokenizer_manager
+    try:
+        result = await tokenizer_manager.get_rank_aware_stats()
+        return JSONResponse({
+            "running_ranks": result.running_ranks,
+            "waiting_ranks": result.waiting_ranks,
+            "num_running": len(result.running_ranks),
+            "num_waiting": len(result.waiting_ranks),
+            "timestamp": time.time(),
+        })
+    except Exception as e:
+        logger.error(f"Failed to get rank_aware_stats: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.api_route("/generate_from_file", methods=["POST"])

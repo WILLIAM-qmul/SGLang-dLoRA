@@ -200,6 +200,54 @@ class LoRAWeightCalculator:
             )
 
         return lora_sizes
+    
+    def get_lora_rank(self, lora_path: str) -> int:
+        """
+        Read the LoRA rank (r) directly from adapter_config.json.
+
+        This is the same file/key that LoRAConfig.get_lora_config() reads —
+        we just expose the single integer 'r' without loading any weights.
+
+        Returns:
+            int: LoRA rank (e.g. 8, 16, 32, 64).  Returns 0 on failure.
+        """
+        try:
+            lora_config = LoRAConfig(path=lora_path)
+            rank = int(lora_config.r)
+            logger.info(
+                f"LoRA rank for {os.path.basename(lora_path)}: r={rank}"
+            )
+            return rank
+        except Exception as e:
+            logger.error(
+                f"Failed to read LoRA rank from {lora_path}: {e}"
+            )
+            return 0
+
+    def get_all_lora_ranks(self) -> Dict[int, int]:
+        """
+        Read the LoRA rank for every adapter in LORA_PATH.
+
+        Iterates lora0 … lora{NUM_LORAS-1} in the same order as
+        calculate_all_lora_sizes(), so model_id indices are consistent.
+
+        Returns:
+            Dict[int, int]: model_id → rank  (e.g. {0: 64, 1: 16, 2: 64, 3: 64})
+        """
+        ranks: Dict[int, int] = {}
+        for i in range(NUM_LORAS):
+            lora_name = f"lora{i}"
+            if lora_name not in LORA_PATH:
+                logger.warning(
+                    f"LoRA {lora_name} not found in LORA_PATH, skipping"
+                )
+                continue
+            lora_path = LORA_PATH[lora_name]
+            ranks[i] = self.get_lora_rank(lora_path)
+            logger.info(
+                f"Model {i} ({lora_name}): rank={ranks[i]}"
+            )
+        return ranks
 
 
 def get_lora_sizes_for_instance_manager(
@@ -228,3 +276,27 @@ def get_lora_sizes_for_instance_manager(
         tp_size=tp_size,
     )
     return calculator.calculate_all_lora_sizes(pcie_bandwidth=pcie_bandwidth)
+
+
+def get_lora_ranks_for_instance_manager(
+    dtype: torch.dtype = torch.float16,
+    tp_size: int = 1,
+) -> Dict[int, int]:
+    """
+    Convenience function: read LoRA ranks for all configured adapters.
+
+    Reads adapter_config.json for each lora in LORA_PATH — the same source
+    that LoRAConfig uses — so no CLI parameter is needed.
+
+    Returns:
+        Dict[int, int]: model_id → rank  (e.g. {0: 64, 1: 16, 2: 64, 3: 64})
+    """
+    base_path = LORA_PATH["base"]
+    calculator = LoRAWeightCalculator(
+        base_model_path=base_path,
+        # max_lora_rank is not used for rank reading, any value is fine
+        max_lora_rank=64,
+        dtype=dtype,
+        tp_size=tp_size,
+    )
+    return calculator.get_all_lora_ranks()

@@ -47,6 +47,12 @@ class InstanceManager:
         dtype: torch.dtype = torch.float16,
         tp_size:  int = 1,
         pcie_bandwidth: float = PCIE_BANDWIDTH,
+        use_rank_aware_scheduling: bool = False,
+         rank_aware_backend: str = "csgmv",
+         rank_aware_avg_resp_len: float = 200.0,
+         rank_aware_slo_ms: float = 300.0,
+         rank_aware_default_req_rank: int = 16,
+         rank_aware_stats_timeout: float = 1.0,
     ):
         # Basic configuration
         self.unified_server_url = f"http://127.0.0.1:8000" 
@@ -129,6 +135,48 @@ class InstanceManager:
         # New: Track number of requests per engine
         self.engine_num_requests: Dict[int, int] = {i: 0 for i in range(num_instances)}
         
+        # ── Rank-aware scheduling (Algorithm 1) ─────────────────────────────
+        self.use_rank_aware_scheduling: bool = use_rank_aware_scheduling
+        self.rank_aware_scheduler: Optional["RankAwareScheduler"] = None
+        # explicit model_id → rank map (set by launch script via --model-lora-ranks)
+        self.model_lora_rank: Dict[int, int] = {}
+        try:
+            from sglang.srt.instances.lora_config_paths import get_model_lora_ranks
+            self.model_lora_rank = get_model_lora_ranks()
+            print(
+                "LoRA ranks loaded from adapter_config.json: "
+                + ", ".join(
+                    f"model_{mid}→r{r}"
+                    for mid, r in sorted(self.model_lora_rank.items())
+                )
+            )
+        except Exception as _e:
+            print(
+                f"[WARN] Could not auto-load LoRA ranks: {_e}. "
+                "Will fall back to size heuristic in _infer_req_rank()."
+            )
+
+        if use_rank_aware_scheduling:
+            from sglang.srt.instances.rank_aware_scheduler import RankAwareScheduler
+            self.rank_aware_scheduler = RankAwareScheduler(
+                instance_urls=instance_urls,
+                backend=rank_aware_backend,
+                avg_resp_len=rank_aware_avg_resp_len,
+                slo_ms=rank_aware_slo_ms,
+                default_req_rank=rank_aware_default_req_rank,
+                stats_timeout=rank_aware_stats_timeout,
+            )
+            logger.info(
+                f"[InstanceManager] Rank-Aware Scheduling ENABLED  "
+                f"backend={rank_aware_backend}  "
+                f"slo={rank_aware_slo_ms}ms  "
+                f"avg_resp_len={rank_aware_avg_resp_len}"
+            )
+        else:
+            logger.info(
+                "[InstanceManager] Using original dLoRA dispatch scheduling"
+            )
+        
         logger.info(f"InstanceManager initialized: {num_instances} instances, {num_models} models")
 
     
@@ -185,7 +233,7 @@ class InstanceManager:
             self.cache_page_size = result.cache_page_size
 
         logger.info(f"Fetched stats:  GPU pages={self.num_gpu_pages}, cache_page_size={self.cache_page_size}")
-
+    
     
     def _initialize_lora_placement(self):
         """Initialize LoRA placement using dLoRA's greedy algorithm"""
@@ -710,85 +758,267 @@ class InstanceManager:
             logger.error(f"Failed to apply LoRA placement to engine {engine_id}: {result. get('errors', [])}")
 
     
+    # async def select_engine(self, request_id: str, model_id: int) -> int:
+    #     """
+    #     Select engine for a new request using dLoRA's dispatch logic.
+        
+    #     Args:
+    #         request_id: Unique request identifier
+    #         model_id: Model ID for this request
+            
+    #     Returns: 
+    #         Selected engine ID
+    #     """
+    #     async with self.select_lock:
+    #         self.expected_lora_distribution[model_id] += 1
+    #         await self._update_engine_costs()
+            
+    #         # If model has no assigned engines, assign to least loaded
+    #         if len(self.model_engine_mapping[model_id]) == 0:
+    #             engine_id = min(
+    #                 range(self.num_instances),
+    #                 key=lambda eid: self.engine_request_count[eid]
+    #             )
+    #             self.model_engine_mapping[model_id] = [engine_id]
+    #             self.engine_model_mapping[engine_id].append(model_id)
+    #             logger.info(f"Added model {model_id} to engine {engine_id} (no prior assignment)")
+                
+    #             # Apply LoRA placement
+    #             await self._apply_lora_placement_single(engine_id)
+            
+    #         # Candidate engines with current model loaded
+    #         candidate_engines = {}
+    #         sub_engine_model_ids = {}
+            
+    #         for engine_id in self.model_engine_mapping[model_id]:
+    #             candidate_engines[engine_id] = self.engine_exec_cost. get(engine_id, 0)
+            
+    #         # Dispatch migration:  try substituting unused LoRAs
+    #         if self.migration_type == MigrationType.DISPATCH_MIG:
+    #             for engine_id, req_model_cnt in self.engine_req_model_cnt.items():
+    #                 if engine_id in candidate_engines:
+    #                     continue
+                    
+    #                 for sub_model_id in self.engine_model_mapping[engine_id]:
+    #                     if req_model_cnt. get(sub_model_id, 0) == 0 and len(self.model_engine_mapping[sub_model_id]) > 1:
+    #                         load_cost = self.lora_load_costs.get(model_id, self.default_exec_time)
+    #                         candidate_engines[engine_id] = self.engine_exec_cost.get(engine_id, 0) + load_cost
+    #                         sub_engine_model_ids[engine_id] = sub_model_id
+    #                         break
+            
+    #         # Select engine with minimum cost
+    #         if not candidate_engines:
+    #             # Fallback to least loaded engine
+    #             min_engine_id = min(
+    #                 range(self.num_instances),
+    #                 key=lambda eid: self.engine_request_count[eid]
+    #             )
+    #             logger.warning(f"No candidate engines for model {model_id}, using least loaded: {min_engine_id}")
+    #         else:
+    #             min_engine_id = min(candidate_engines, key=candidate_engines.get)
+            
+    #         # Apply substitution if needed
+    #         if min_engine_id in sub_engine_model_ids:
+    #             sub_model_id = sub_engine_model_ids[min_engine_id]
+    #             logger.info(f"Substituting model {sub_model_id} with {model_id} on engine {min_engine_id}")
+                
+    #             self.engine_model_mapping[min_engine_id].remove(sub_model_id)
+    #             self.model_engine_mapping[sub_model_id].remove(min_engine_id)
+    #             self.engine_model_mapping[min_engine_id].append(model_id)
+    #             self.model_engine_mapping[model_id].append(min_engine_id)
+                
+    #             # Apply to instance
+    #             await self._apply_lora_placement_single(min_engine_id)
+            
+    #         # Track request
+    #         self.request_to_engine[request_id] = min_engine_id
+    #         self.engine_request_count[min_engine_id] += 1
+            
+    #         logger.debug(f"Request {request_id} (model {model_id}) -> Engine {min_engine_id}")
+            
+    #         return min_engine_id
+    
     async def select_engine(self, request_id: str, model_id: int) -> int:
         """
-        Select engine for a new request using dLoRA's dispatch logic.
-        
-        Args:
-            request_id: Unique request identifier
-            model_id: Model ID for this request
-            
-        Returns: 
-            Selected engine ID
+        Select engine for a new request.
+
+        If use_rank_aware_scheduling=True:
+            Runs TOPPINGS Algorithm 1.  Candidate engines are filtered the
+            same way as in the original dLoRA logic (model must be loaded /
+            dispatachable), then the one with minimum total_cost is chosen.
+
+        Else:
+            Falls back to original dLoRA dispatch logic (unmodified).
         """
+        if self.use_rank_aware_scheduling and self.rank_aware_scheduler is not None:
+            return await self._select_engine_rank_aware(request_id, model_id)
+        return await self._select_engine_dlora(request_id, model_id)
+
+    # ── Original dLoRA logic (preserved verbatim) ──────────────────────────────
+
+    async def _select_engine_dlora(self, request_id: str, model_id: int) -> int:
+        """Original dLoRA dispatch logic — unchanged from the previous select_engine."""
         async with self.select_lock:
             self.expected_lora_distribution[model_id] += 1
             await self._update_engine_costs()
-            
-            # If model has no assigned engines, assign to least loaded
+
             if len(self.model_engine_mapping[model_id]) == 0:
                 engine_id = min(
                     range(self.num_instances),
-                    key=lambda eid: self.engine_request_count[eid]
+                    key=lambda eid: self.engine_request_count[eid],
                 )
                 self.model_engine_mapping[model_id] = [engine_id]
                 self.engine_model_mapping[engine_id].append(model_id)
-                logger.info(f"Added model {model_id} to engine {engine_id} (no prior assignment)")
-                
-                # Apply LoRA placement
+                logger.info(
+                    f"Added model {model_id} to engine {engine_id} (no prior assignment)"
+                )
                 await self._apply_lora_placement_single(engine_id)
-            
-            # Candidate engines with current model loaded
-            candidate_engines = {}
-            sub_engine_model_ids = {}
-            
+
+            candidate_engines: Dict[int, float] = {}
+            sub_engine_model_ids: Dict[int, int] = {}
+
             for engine_id in self.model_engine_mapping[model_id]:
-                candidate_engines[engine_id] = self.engine_exec_cost. get(engine_id, 0)
-            
-            # Dispatch migration:  try substituting unused LoRAs
+                candidate_engines[engine_id] = self.engine_exec_cost.get(engine_id, 0)
+
             if self.migration_type == MigrationType.DISPATCH_MIG:
                 for engine_id, req_model_cnt in self.engine_req_model_cnt.items():
                     if engine_id in candidate_engines:
                         continue
-                    
                     for sub_model_id in self.engine_model_mapping[engine_id]:
-                        if req_model_cnt. get(sub_model_id, 0) == 0 and len(self.model_engine_mapping[sub_model_id]) > 1:
-                            load_cost = self.lora_load_costs.get(model_id, self.default_exec_time)
-                            candidate_engines[engine_id] = self.engine_exec_cost.get(engine_id, 0) + load_cost
+                        if (
+                            req_model_cnt.get(sub_model_id, 0) == 0
+                            and len(self.model_engine_mapping[sub_model_id]) > 1
+                        ):
+                            load_cost = self.lora_load_costs.get(
+                                model_id, self.default_exec_time
+                            )
+                            candidate_engines[engine_id] = (
+                                self.engine_exec_cost.get(engine_id, 0) + load_cost
+                            )
                             sub_engine_model_ids[engine_id] = sub_model_id
                             break
-            
-            # Select engine with minimum cost
+
             if not candidate_engines:
-                # Fallback to least loaded engine
                 min_engine_id = min(
                     range(self.num_instances),
-                    key=lambda eid: self.engine_request_count[eid]
+                    key=lambda eid: self.engine_request_count[eid],
                 )
-                logger.warning(f"No candidate engines for model {model_id}, using least loaded: {min_engine_id}")
+                logger.warning(
+                    f"No candidate engines for model {model_id}, "
+                    f"using least loaded: {min_engine_id}"
+                )
             else:
                 min_engine_id = min(candidate_engines, key=candidate_engines.get)
-            
-            # Apply substitution if needed
+
             if min_engine_id in sub_engine_model_ids:
                 sub_model_id = sub_engine_model_ids[min_engine_id]
-                logger.info(f"Substituting model {sub_model_id} with {model_id} on engine {min_engine_id}")
-                
+                logger.info(
+                    f"Substituting model {sub_model_id} with {model_id} "
+                    f"on engine {min_engine_id}"
+                )
                 self.engine_model_mapping[min_engine_id].remove(sub_model_id)
                 self.model_engine_mapping[sub_model_id].remove(min_engine_id)
                 self.engine_model_mapping[min_engine_id].append(model_id)
                 self.model_engine_mapping[model_id].append(min_engine_id)
-                
-                # Apply to instance
                 await self._apply_lora_placement_single(min_engine_id)
-            
-            # Track request
+
             self.request_to_engine[request_id] = min_engine_id
             self.engine_request_count[min_engine_id] += 1
-            
-            logger.debug(f"Request {request_id} (model {model_id}) -> Engine {min_engine_id}")
-            
+            logger.debug(
+                f"Request {request_id} (model {model_id}) -> Engine {min_engine_id}"
+            )
             return min_engine_id
+
+    # ── NEW: Rank-aware dispatch ───────────────────────────────────────────────
+
+    async def _select_engine_rank_aware(
+        self, request_id: str, model_id: int
+    ) -> int:
+        """
+        Rank-Aware dispatch (Algorithm 1):
+          1. Ensure model has ≥1 assigned engine (same as dLoRA).
+          2. Infer req_rank from model_lora_rank map → lora_weight_sizes heuristic.
+          3. Release lock before async HTTP calls (non-blocking).
+          4. Call RankAwareScheduler.select_engine() with candidate_ids.
+          5. Re-acquire lock to update tracking state.
+        """
+        # ── Step 1: ensure model assignment (needs lock) ───────────���──────────
+        async with self.select_lock:
+            self.expected_lora_distribution[model_id] += 1
+
+            if len(self.model_engine_mapping[model_id]) == 0:
+                engine_id = min(
+                    range(self.num_instances),
+                    key=lambda eid: self.engine_request_count[eid],
+                )
+                self.model_engine_mapping[model_id] = [engine_id]
+                self.engine_model_mapping[engine_id].append(model_id)
+                logger.info(
+                    f"[RankAware] Added model {model_id} to engine {engine_id}"
+                )
+                await self._apply_lora_placement_single(engine_id)
+
+            candidate_ids: List[int] = list(self.model_engine_mapping[model_id])
+            if not candidate_ids:
+                candidate_ids = list(range(self.num_instances))
+
+            req_rank = self._infer_req_rank(model_id)
+
+        # ── Step 2: async HTTP fetch + cost computation (lock released) ───────
+        selected_engine = await self.rank_aware_scheduler.select_engine(
+            req_rank=req_rank,
+            candidate_ids=candidate_ids,
+        )
+
+        # ── Step 3: update tracking (re-acquire lock) ─────────────────────────
+        async with self.select_lock:
+            self.request_to_engine[request_id]        = selected_engine
+            self.engine_request_count[selected_engine] += 1
+
+        logger.debug(
+            f"[RankAware] request {request_id} "
+            f"(model {model_id}, rank {req_rank}) → engine {selected_engine}"
+        )
+        return selected_engine
+
+    def _infer_req_rank(self, model_id: int) -> int:
+        """
+        Infer the LoRA rank for a given model_id.
+
+        Lookup order:
+          1. self.model_lora_rank[model_id]
+             Populated automatically at __init__ time by reading each adapter's
+             adapter_config.json via LoRAConfig — the same source/key used by
+             the rest of the codebase (LoRAConfig.r).
+             This path succeeds for every configured adapter in LORA_PATH.
+
+          2. lora_weight_sizes heuristic (Llama-2-7b size buckets)
+             Fallback if adapter_config.json could not be read at startup.
+             Approximate mapping:  <40 MB→r8 / <80 MB→r16 / <160 MB→r32 / else→r64
+
+          3. rank_aware_scheduler.default_req_rank
+             Last-resort fallback (configurable via --rank-aware-default-req-rank,
+             default 16).
+        """
+        # 1. Exact rank from adapter_config.json (auto-loaded at __init__)
+        if model_id in self.model_lora_rank:
+            return int(self.model_lora_rank[model_id])
+
+        # 2. Size heuristic — only reached if adapter_config.json read failed
+        size_bytes = self.lora_weight_sizes.get(model_id, 0)
+        if size_bytes > 0:
+            size_mb = size_bytes / (1024 * 1024)
+            if size_mb < 40:
+                return 8
+            elif size_mb < 80:
+                return 16
+            elif size_mb < 160:
+                return 32
+            else:
+                return 64
+
+        # 3. Configured default
+        return self.rank_aware_scheduler.default_req_rank
 
     
     def is_running(self) -> bool:

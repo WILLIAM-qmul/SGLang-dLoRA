@@ -122,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     GetMigrationInfoReqOutput,
     FetchReqsInput,
     FetchReqsOutput,
+    GetRankAwareStatsReqInput,
+    GetRankAwareStatsReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -588,11 +590,19 @@ class Scheduler(
                 (GetReqModelCntReqInput, self.get_req_model_cnt),
                 (GetMigrationInfoReqInput, self.get_migration_info),
                 (FetchReqsInput, self.fetch_requests_stats),
+                (GetRankAwareStatsReqInput, self.get_rank_aware_stats),
             ]
         )
         
         # ===== Credit Scheduling 初始化 =====
-        self._init_credit_scheduling(server_args)
+        self.enable_credit_schedule = server_args.enable_credit_schedule
+        if self.enable_credit_schedule:
+            self._init_credit_scheduling(server_args)
+        
+        # # ========== 新增: Decode Credit Scheduling ==========
+        # self.enable_decode_credit_schedule = server_args.enable_decode_credit_schedule
+        # if self.enable_decode_credit_schedule:
+        #     self._init_credit_scheduling_decode(server_args)
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -2044,7 +2054,6 @@ class Scheduler(
             f"max_loras_per_batch={max_loras}"
         )
 
-
     def _get_new_batch_prefill_with_credit(self) -> Optional[ScheduleBatch]:
         """
         Schedule a new prefill batch using credit scheduling strategy.
@@ -2278,7 +2287,6 @@ class Scheduler(
         
         return batch
 
-
     def _build_batch_from_reqs(self, selected_reqs: List[Req]) -> Optional[ScheduleBatch]:
         """
         Build a batch from selected requests.
@@ -2307,7 +2315,6 @@ class Scheduler(
         batch = self._build_batch_from_selected_reqs(selected_reqs)
         
         return batch
-
 
     def _build_batch_from_selected_reqs(self, selected_reqs: List[Req]) -> Optional[ScheduleBatch]:
         """
@@ -2444,7 +2451,6 @@ class Scheduler(
         
         return new_batch
 
-
     def _update_loras_in_gpu_with_lru(self, active_lora_set: set):
         """
         Update loras_in_gpu using LRU strategy (adapted from dLoRA's logic).
@@ -2493,7 +2499,6 @@ class Scheduler(
             f"[LoRA Management] GPU slots: {self.loras_in_gpu}, "
             f"Active: {self.active_loras}"
         )
-
 
     def _adjust_credit_dlora_style(
         self,
@@ -2563,7 +2568,6 @@ class Scheduler(
                         f"[Credit] Batch skip: {dominant_lora} batch skipped {fcfs_lora}, "
                         f"credit_cost={credit_cost/2:.4f}"
                     )
-
 
     def _adjust_merge_threshold(self):
         """Adjust merge threshold using AIMD algorithm"""
@@ -2883,48 +2887,66 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
+        # 记录当前解码批次的初始请求数（用于后续判断批次是否缩小，从而重置 batch_is_full）
         initial_bs = batch.batch_size()
 
+        # 过滤掉已经完成或需要剔除的请求（例如 finished、abort、chunked 排除等），保持 batch.reqs 为“仍需继续解码”的集合
         batch.filter_batch()
+        # 如果过滤后批次为空，说明没有可继续解码的请求
         if batch.is_empty():
+            # 标记此批次不再“满载”，后续可允许 prefill 继续加入新的请求
             batch.batch_is_full = False
+            # 返回该空批次（上层会据此跳过 decode）
             return batch
 
-        # Check if decode out of memory
+        # 检查解码阶段是否会发生显存不足（包括推测解码扩大了显存占用的情况）
+        # 或者在测试模式下（TEST_RETRACT）按固定间隔强制进行一次撤回（用于调试）
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            # 记录撤回前的 new_token_ratio（每轮可接受的新 token 比例），用于日志对比
             old_ratio = self.new_token_ratio
+            # 执行撤回逻辑：返回被撤回的请求、调整后的 new_token_ratio、以及需要直接 abort 的请求
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            # 统计本轮撤回的请求数量（用于指标/日志）
             self.num_retracted_reqs = len(retracted_reqs)
+            # 更新 new_token_ratio（降低每轮新增 token 的比例，以缓解内存压力）
             self.new_token_ratio = new_token_ratio
+            # 对需要直接中止的请求发送 Abort 响应（rpc/管道通知上游清理状态）
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
                     AbortReq(abort_message=abort_reason.message, rid=req.rid), req
                 )
 
+            # 打印日志：提示 KV 缓存溢出，进行了撤回，并展示 new_token_ratio 的调整
             logger.info(
                 "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
 
+            # 将被撤回的请求重新放回等待队列（waiting_queue），以便后续在资源允许时通过 prefill/extend 再次进入解码
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
+            # 如果没有发生 OOM，逐步降低 new_token_ratio（按预设的衰减步长），但不低于最小阈值
+            # 作用：在稳定情况下逐步提高吞吐（更少的保守新 token 比例），但保持安全下限
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
 
+        # 如果过滤后批次的请求数减少了（例如有请求完成或被撤回），则将批次标记为不满载（允许下一轮加入新的请求）
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
-        # Update batch tensors
+        # 更新批次的张量视图/输入输出结构到“解码模式”
+        # 典型操作：将上一轮的 output_ids 作为本轮的 input_ids，准备每请求只分配一个 token 的解码步（以及推测解码的相关缓冲）
         batch.prepare_for_decode()
+        # 返回更新后的批次（上层会用它继续进行 decode forward）
         return batch
 
     # placeholder for override
@@ -3595,6 +3617,73 @@ class Scheduler(
                     found_requests.append(serialize_req(req))
 
         return FetchReqsOutput(requests=found_requests, success=True)
+    
+    
+    def get_rank_aware_stats(
+        self, recv_req: "GetRankAwareStatsReqInput"
+    ) -> "GetRankAwareStatsReqOutput":
+        """
+        Collect the LoRA rank for every request in running_batch and
+        waiting_queue.  Only the rank integer is returned — no output_dim,
+        no weight paths — keeping the payload minimal for the scheduler.
+
+        Rank resolution order (per request):
+          1. req.lora_rank          – set explicitly by upstream
+          2. lora_manager lookup    – via req.lora_id / req.lora_name
+          3. 0                      – base model / unknown
+        """
+
+        def _rank_of(req) -> int:
+            # 1. Explicit attribute
+            if hasattr(req, "lora_rank") and req.lora_rank is not None:
+                try:
+                    return int(req.lora_rank)
+                except (TypeError, ValueError):
+                    pass
+
+            # 2. Via lora_manager
+            if (
+                hasattr(self, "lora_manager")
+                and self.lora_manager is not None
+            ):
+                lora_id = getattr(req, "lora_id", None)
+                if lora_id is not None:
+                    try:
+                        cfg = self.lora_manager.lora_configs.get(lora_id)
+                        if cfg is not None:
+                            return int(cfg.r)
+                    except Exception:
+                        pass
+
+                lora_name = getattr(req, "lora_name", None)
+                if lora_name is not None:
+                    try:
+                        cfg = self.lora_manager.lora_configs.get(lora_name)
+                        if cfg is not None:
+                            return int(cfg.r)
+                    except Exception:
+                        pass
+
+            # 3. Fallback
+            return 0
+
+        running_ranks: list[int] = []
+        if (
+            hasattr(self, "running_batch")
+            and self.running_batch is not None
+            and hasattr(self.running_batch, "reqs")
+        ):
+            for req in self.running_batch.reqs:
+                running_ranks.append(_rank_of(req))
+
+        waiting_ranks: list[int] = []
+        for req in self.waiting_queue:
+            waiting_ranks.append(_rank_of(req))
+
+        return GetRankAwareStatsReqOutput(
+            running_ranks=running_ranks,
+            waiting_ranks=waiting_ranks,
+        )
     
 
     def get_internal_state(self, recv_req: GetInternalStateReq):

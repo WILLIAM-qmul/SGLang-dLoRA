@@ -1193,6 +1193,85 @@ def sample_sharegpt_requests(
     print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
 
+def compute_sharegpt_avg_resp_len(
+    dataset_path: str,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
+    prompt_suffix: Optional[str] = "",
+    apply_chat_template: bool = False,
+) -> float:
+    """Compute average completion length (in tokens) over ALL valid ShareGPT samples."""
+    # Download sharegpt if necessary
+    if not is_file_valid_json(dataset_path) and dataset_path == "":
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
+
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+
+    # Filter out the conversations with less than 2 turns.
+    dataset = [
+        data
+        for data in dataset
+        if len(data.get("conversations", data.get("conversation", []))) >= 2
+    ]
+    # Only keep the first two turns of each conversation.
+    pairs = [
+        (
+            data.get("conversations", data.get("conversation", []))[0]["value"],
+            data.get("conversations", data.get("conversation", []))[1]["value"],
+        )
+        for data in dataset
+    ]
+
+    total_output_tokens = 0
+    valid_count = 0
+
+    for prompt, completion in pairs:
+        # Build prompt (same as sample_sharegpt_requests)
+        if prompt_suffix:
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
+
+        if apply_chat_template:
+            prompt_tmpl = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if tokenizer.bos_token:
+                prompt_tmpl = prompt_tmpl.replace(tokenizer.bos_token, "")
+            prompt = prompt_tmpl
+
+        prompt_token_ids = tokenizer.encode(prompt)
+        completion_token_ids = tokenizer.encode(completion)
+        prompt_len = len(prompt_token_ids)
+        output_len = (
+            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
+        )
+
+        # Apply the same filters as sample_sharegpt_requests
+        if prompt_len < 2 or output_len < 2:
+            continue
+        if context_len and prompt_len + output_len > context_len:
+            continue
+
+        total_output_tokens += output_len
+        valid_count += 1
+
+    if valid_count == 0:
+        raise ValueError("No valid ShareGPT samples found under current filters.")
+
+    avg_resp_len = total_output_tokens / valid_count
+    print(f"[ShareGPT] valid samples = {valid_count}")
+    print(f"[ShareGPT] total_output_tokens = {total_output_tokens}")
+    print(f"[ShareGPT] avg_resp_len = {avg_resp_len:.3f} tokens")
+    return float(avg_resp_len)
+
 
 def sample_random_requests(
     input_len: int,

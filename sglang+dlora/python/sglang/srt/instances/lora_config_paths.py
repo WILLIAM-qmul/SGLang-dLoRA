@@ -59,3 +59,60 @@ def get_lora_id(lora_name: str) -> int:
         return int(lora_name.replace("lora", "")) if lora_name. startswith("lora") else 0
     except (ValueError, AttributeError):
         return 0
+    
+
+_LORA_RANK_CACHE: Dict[str, int] = {}
+
+
+def get_lora_rank(lora_name: str) -> int:
+    """
+    Return the LoRA rank (r) for a named adapter.
+
+    On the first call for a given lora_name, reads adapter_config.json
+    from the adapter directory (same file / key that LoRAConfig uses).
+    Results are cached in module-level _LORA_RANK_CACHE for all subsequent calls.
+
+    Args:
+        lora_name: Adapter name as in LORA_PATH, e.g. "lora0", "lora1".
+
+    Returns:
+        int: rank r (e.g. 8, 16, 32, 64).  Returns 0 on any error.
+
+    Example:
+        >>> get_lora_rank("lora0")
+        64
+    """
+    if lora_name in _LORA_RANK_CACHE:
+        return _LORA_RANK_CACHE[lora_name]
+
+    if lora_name not in LORA_PATH:
+        return 0
+
+    lora_path = LORA_PATH[lora_name]
+    try:
+        # Import here to avoid circular imports at module level
+        from sglang.srt.lora.lora_config import LoRAConfig
+        cfg = LoRAConfig(path=lora_path)
+        rank = int(cfg.r)
+    except Exception:
+        rank = 0
+
+    _LORA_RANK_CACHE[lora_name] = rank
+    return rank
+
+
+def get_model_lora_ranks() -> Dict[str, int]:
+    """
+    Return a mapping of model_id (int) → rank (int) for all adapters.
+
+    Reads adapter_config.json for each lora0…lora{NUM_LORAS-1} in LORA_PATH.
+    This is the canonical way to obtain ranks without any CLI argument.
+
+    Returns:
+        Dict[int, int]: {0: 64, 1: 16, 2: 64, 3: 64}  (example)
+    """
+    result: Dict[int, int] = {}
+    for i in range(NUM_LORAS):
+        lora_name = f"lora{i}"
+        result[i] = get_lora_rank(lora_name)
+    return result
