@@ -764,11 +764,12 @@ async def get_rank_aware_stats(request: Request):
     try:
         result = await tokenizer_manager.get_rank_aware_stats()
         return JSONResponse({
-            "running_ranks": result.running_ranks,
-            "waiting_ranks": result.waiting_ranks,
-            "num_running": len(result.running_ranks),
-            "num_waiting": len(result.waiting_ranks),
-            "timestamp": time.time(),
+            "running_ranks":    result.running_ranks,
+            "waiting_ranks":    result.waiting_ranks,
+            "waiting_seq_lens": result.waiting_seq_lens,    # <-- 新增
+            "num_running":      len(result.running_ranks),
+            "num_waiting":      len(result.waiting_ranks),
+            "timestamp":        time.time(),
         })
     except Exception as e:
         logger.error(f"Failed to get rank_aware_stats: {e}")

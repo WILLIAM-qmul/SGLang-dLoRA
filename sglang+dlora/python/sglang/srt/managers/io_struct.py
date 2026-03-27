@@ -1770,17 +1770,18 @@ class GetRankAwareStatsReqInput(BaseReq):
 
 
 @dataclass
+@dataclass
 class GetRankAwareStatsReqOutput(BaseReq):
     """
     Returned by Scheduler → TokenizerManager.
 
-    running_ranks : LoRA rank per request currently in running_batch.
-                    0 = base model (no LoRA).
-    waiting_ranks : LoRA rank per request in waiting_queue.
-                    0 = base model (no LoRA).
+    running_ranks   : LoRA rank per request currently in running_batch.
+    waiting_ranks   : LoRA rank per request in waiting_queue.
+    waiting_seq_lens: input token length per request in waiting_queue.
     """
-    running_ranks: List[int] = field(default_factory=list)
-    waiting_ranks: List[int] = field(default_factory=list)
+    running_ranks:    List[int] = field(default_factory=list)
+    waiting_ranks:    List[int] = field(default_factory=list)
+    waiting_seq_lens: List[int] = field(default_factory=list)
 
 
 def _check_all_req_types():

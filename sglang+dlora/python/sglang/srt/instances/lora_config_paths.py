@@ -8,15 +8,27 @@ This file should be the single source of truth for LoRA paths across all compone
 from typing import Dict
 
 # Number of LoRA adapters
-NUM_LORAS = 4
+NUM_LORAS = 16
 
 # LoRA model paths configuration
 LORA_PATH:  Dict[str, str] = {
     "base": "/workspace/models/Llama-2-7b-hf",
-    "lora0": "/workspace/models/llama-2-7b-chat-lora-adaptor",
-    "lora1": "/workspace/models/llama-2-7b-LORA-data-analyst",
-    "lora2": "/workspace/models/llama2-stable-7b-lora",
-    "lora3": "/workspace/models/llava-llama-2-7b-chat-lightning-lora-preview",
+    "lora0": "/workspace/models/adapters/8/Llama2-7B-LoRA-Adapter",
+    "lora1": "/workspace/models/adapters/8/llama2-7b-lora-genwiki",
+    "lora2": "/workspace/models/adapters/8/llama2-7b-lora-rebel",
+    "lora3": "/workspace/models/adapters/8/MUFFIN-Llama2-lora-7B",
+    "lora4": "/workspace/models/adapters/16/llama-2-7b-hf-lora-alpaca-json",
+    "lora5": "/workspace/models/adapters/16/llama-2-7b-LORA-data-analyst",
+    "lora6": "/workspace/models/adapters/16/llama-2-7b-lora-v1",
+    "lora7": "/workspace/models/adapters/16/llama2-7B-init-dolly-lora",
+    "lora8": "/workspace/models/adapters/32/Final_llama2-7B-lora_r_32",
+    "lora9": "/workspace/models/adapters/32/llama-2-7b-sft-lora",
+    "lora10": "/workspace/models/adapters/32/llama2-7b-recipe-lora",
+    "lora11": "/workspace/models/adapters/32/ola_llama2_7B_lora1",
+    "lora12": "/workspace/models/adapters/64/azma-llama2-7b-hf-lora-adapter",
+    "lora13": "/workspace/models/adapters/64/llama-2-7b-chat-lora-adaptor",
+    "lora14": "/workspace/models/adapters/64/llama2-7b-airos-lora",
+    "lora15": "/workspace/models/adapters/64/llama2-stable-7b-lora",
 }
 
 

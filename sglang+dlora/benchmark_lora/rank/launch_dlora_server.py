@@ -532,8 +532,12 @@ async def generate(request: Request):
         model_id = 0
 
     request_id = request_dict.get("rid", f"req_{uuid.uuid4().hex[:12]}")
+    
+    req_seq_len = int(request_dict.get("prompt_len"))
 
-    instance_id = await manager.select_engine(request_id, model_id)
+    instance_id = await manager.select_engine(
+        request_id, model_id, req_seq_len=req_seq_len
+    )
     
     client_disconnected = False
 

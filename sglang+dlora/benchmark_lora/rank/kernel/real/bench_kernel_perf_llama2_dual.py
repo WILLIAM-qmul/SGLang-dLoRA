@@ -96,7 +96,7 @@ ADAPTER_REGISTRY: List[Tuple[str, int]] = [
     ("/workspace/models/adapters/16/llama2-7B-init-dolly-lora",      16),
     # rank=32
     ("/workspace/models/adapters/32/llama-2-7b-sft-lora",                 32),
-    ("/workspace/models/adapters/32/Llama-2-7b-hf-lora-r32-wnli-loraxs", 32),
+    ("/workspace/models/adapters/32/Final_llama2-7B-lora_r_32", 32),
     ("/workspace/models/adapters/32/llama2-7b-recipe-lora",               32),
     ("/workspace/models/adapters/32/ola_llama2_7B_lora1",                 32),
     # rank=64

@@ -214,25 +214,89 @@ class InstanceManager:
             return None
 
 
-    async def _fetch_instance_initial_stats(self):
-        """Fetch initial stats from all instances"""
+    # async def _fetch_instance_initial_stats(self):
+    #     """Fetch initial stats from all instances"""
+    #     session = await self._get_session()
+
+    #     tasks = []
+    #     for engine_id in range(self.num_instances):
+    #         url = f"{self.instance_urls[engine_id]}/get_instance_stats"
+    #         tasks.append(self._fetch_instance_stats(session, engine_id, url))
+
+    #     results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    #     for engine_id, result in enumerate(results):
+    #         self.instance_stats[engine_id] = result
+    #         self.engine_lora_capacity[engine_id] = result.lora_capacity
+    #         self.num_gpu_pages[engine_id] = result.num_free_gpu_pages
+    #         self.available_gpu_memorys[engine_id] = result.available_gpu_memory
+    #         self.cache_page_size = result.cache_page_size
+
+    #     logger.info(f"Fetched stats:  GPU pages={self.num_gpu_pages}, cache_page_size={self.cache_page_size}")
+    async def _fetch_instance_initial_stats(
+        self,
+        max_retries: int = 30,
+        retry_interval: float = 3.0,
+    ):
+        """
+        Fetch initial stats from all instances, with retry until all respond.
+
+        The unified server may call initialize() before all SGLang instances
+        finish startup.  We poll every `retry_interval` seconds until every
+        instance returns a valid InstanceStats, or raise after `max_retries`.
+        """
         session = await self._get_session()
 
-        tasks = []
-        for engine_id in range(self.num_instances):
-            url = f"{self.instance_urls[engine_id]}/get_instance_stats"
-            tasks.append(self._fetch_instance_stats(session, engine_id, url))
+        for attempt in range(1, max_retries + 1):
+            tasks = [
+                self._fetch_instance_stats(
+                    session,
+                    engine_id,
+                    f"{self.instance_urls[engine_id]}/get_instance_stats",
+                )
+                for engine_id in range(self.num_instances)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Check: all results must be valid InstanceStats (not None / Exception)
+            all_ok = True
+            for engine_id, result in enumerate(results):
+                if result is None or isinstance(result, Exception):
+                    logger.warning(
+                        f"[init] Instance {engine_id} not ready yet "
+                        f"(attempt {attempt}/{max_retries}): {result}"
+                    )
+                    all_ok = False
 
-        for engine_id, result in enumerate(results):
-            self.instance_stats[engine_id] = result
-            self.engine_lora_capacity[engine_id] = result.lora_capacity
-            self.num_gpu_pages[engine_id] = result.num_free_gpu_pages
-            self.available_gpu_memorys[engine_id] = result.available_gpu_memory
-            self.cache_page_size = result.cache_page_size
+            if all_ok:
+                # All instances responded — commit the results
+                for engine_id, result in enumerate(results):
+                    self.instance_stats[engine_id] = result
+                    self.engine_lora_capacity[engine_id] = result.lora_capacity
+                    self.num_gpu_pages[engine_id] = result.num_free_gpu_pages
+                    self.available_gpu_memorys[engine_id] = result.available_gpu_memory
+                    self.cache_page_size = result.cache_page_size
 
-        logger.info(f"Fetched stats:  GPU pages={self.num_gpu_pages}, cache_page_size={self.cache_page_size}")
+                logger.info(
+                    f"Fetched stats (attempt {attempt}): "
+                    f"GPU pages={self.num_gpu_pages}, "
+                    f"cache_page_size={self.cache_page_size}"
+                )
+                return
+
+            if attempt < max_retries:
+                logger.info(
+                    f"[init] Waiting {retry_interval}s for instances to become ready "
+                    f"({attempt}/{max_retries})..."
+                )
+                await asyncio.sleep(retry_interval)
+
+        # Last-resort: fail loudly with a descriptive message
+        raise RuntimeError(
+            f"[InstanceManager] Could not fetch stats from all {self.num_instances} "
+            f"instances after {max_retries} attempts ({max_retries * retry_interval:.0f}s total). "
+            "Check that all SGLang instances started successfully."
+        )
     
     
     def _initialize_lora_placement(self):
@@ -838,7 +902,9 @@ class InstanceManager:
             
     #         return min_engine_id
     
-    async def select_engine(self, request_id: str, model_id: int) -> int:
+    async def select_engine(
+        self, request_id: str, model_id: int, req_seq_len: int = 1
+    ) -> int:
         """
         Select engine for a new request.
 
@@ -851,7 +917,9 @@ class InstanceManager:
             Falls back to original dLoRA dispatch logic (unmodified).
         """
         if self.use_rank_aware_scheduling and self.rank_aware_scheduler is not None:
-            return await self._select_engine_rank_aware(request_id, model_id)
+            return await self._select_engine_rank_aware(
+                request_id, model_id, req_seq_len=req_seq_len
+            )
         return await self._select_engine_dlora(request_id, model_id)
 
     # ── Original dLoRA logic (preserved verbatim) ──────────────────────────────
@@ -931,18 +999,19 @@ class InstanceManager:
 
     # ── NEW: Rank-aware dispatch ───────────────────────────────────────────────
 
+    # 找到 _select_engine_rank_aware 的定义，改成如下：
     async def _select_engine_rank_aware(
-        self, request_id: str, model_id: int
+        self, request_id: str, model_id: int, req_seq_len: int = 1
     ) -> int:
         """
         Rank-Aware dispatch (Algorithm 1):
-          1. Ensure model has ≥1 assigned engine (same as dLoRA).
-          2. Infer req_rank from model_lora_rank map → lora_weight_sizes heuristic.
-          3. Release lock before async HTTP calls (non-blocking).
-          4. Call RankAwareScheduler.select_engine() with candidate_ids.
-          5. Re-acquire lock to update tracking state.
+        1. Ensure model has ≥1 assigned engine (same as dLoRA).
+        2. Infer req_rank from model_lora_rank map → lora_weight_sizes heuristic.
+        3. Release lock before async HTTP calls (non-blocking).
+        4. Call RankAwareScheduler.select_engine() with candidate_ids.
+        5. Re-acquire lock to update tracking state.
         """
-        # ── Step 1: ensure model assignment (needs lock) ───────────���──────────
+        # ── Step 1: ensure model assignment (needs lock) ─────────────────────────
         async with self.select_lock:
             self.expected_lora_distribution[model_id] += 1
 
@@ -964,13 +1033,14 @@ class InstanceManager:
 
             req_rank = self._infer_req_rank(model_id)
 
-        # ── Step 2: async HTTP fetch + cost computation (lock released) ───────
+        # ── Step 2: async HTTP fetch + cost computation (lock released) ──────────
         selected_engine = await self.rank_aware_scheduler.select_engine(
             req_rank=req_rank,
             candidate_ids=candidate_ids,
+            req_seq_len=req_seq_len,
         )
 
-        # ── Step 3: update tracking (re-acquire lock) ─────────────────────────
+        # ── Step 3: update tracking (re-acquire lock) ────────────────────────────
         async with self.select_lock:
             self.request_to_engine[request_id]        = selected_engine
             self.engine_request_count[selected_engine] += 1

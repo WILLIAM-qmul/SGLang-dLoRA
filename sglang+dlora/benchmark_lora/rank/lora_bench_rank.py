@@ -91,6 +91,7 @@ async def async_request_openai_completions(
                 "text": prompt,
                 "sampling_params": {"max_new_tokens": request_func_input.output_len},
                 "lora_path": request_func_input.lora_name,
+                "prompt_len": request_func_input.prompt_len,
             }
         headers = {"Authorization": ""}
 

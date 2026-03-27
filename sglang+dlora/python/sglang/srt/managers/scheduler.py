@@ -3623,14 +3623,8 @@ class Scheduler(
         self, recv_req: "GetRankAwareStatsReqInput"
     ) -> "GetRankAwareStatsReqOutput":
         """
-        Collect the LoRA rank for every request in running_batch and
-        waiting_queue.  Only the rank integer is returned — no output_dim,
-        no weight paths — keeping the payload minimal for the scheduler.
-
-        Rank resolution order (per request):
-          1. req.lora_rank          – set explicitly by upstream
-          2. lora_manager lookup    – via req.lora_id / req.lora_name
-          3. 0                      – base model / unknown
+        Collect LoRA rank AND input seq_len for every request
+        in running_batch and waiting_queue.
         """
 
         def _rank_of(req) -> int:
@@ -3667,6 +3661,11 @@ class Scheduler(
             # 3. Fallback
             return 0
 
+        def _seq_len_of(req) -> int:                
+            if hasattr(req, "origin_input_ids") and req.origin_input_ids is not None:
+                return len(req.origin_input_ids)
+            return 1
+
         running_ranks: list[int] = []
         if (
             hasattr(self, "running_batch")
@@ -3676,13 +3675,16 @@ class Scheduler(
             for req in self.running_batch.reqs:
                 running_ranks.append(_rank_of(req))
 
-        waiting_ranks: list[int] = []
+        waiting_ranks:    list[int] = []
+        waiting_seq_lens: list[int] = []                 
         for req in self.waiting_queue:
             waiting_ranks.append(_rank_of(req))
+            waiting_seq_lens.append(_seq_len_of(req))      
 
         return GetRankAwareStatsReqOutput(
             running_ranks=running_ranks,
             waiting_ranks=waiting_ranks,
+            waiting_seq_lens=waiting_seq_lens,              
         )
     
 
