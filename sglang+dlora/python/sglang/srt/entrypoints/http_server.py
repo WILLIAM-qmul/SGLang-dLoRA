@@ -766,7 +766,7 @@ async def get_rank_aware_stats(request: Request):
         return JSONResponse({
             "running_ranks":    result.running_ranks,
             "waiting_ranks":    result.waiting_ranks,
-            "waiting_seq_lens": result.waiting_seq_lens,    # <-- 新增
+            "waiting_seq_lens": result.waiting_seq_lens,
             "num_running":      len(result.running_ranks),
             "num_waiting":      len(result.waiting_ranks),
             "timestamp":        time.time(),

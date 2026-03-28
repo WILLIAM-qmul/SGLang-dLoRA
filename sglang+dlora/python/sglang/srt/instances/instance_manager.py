@@ -53,6 +53,8 @@ class InstanceManager:
          rank_aware_slo_ms: float = 300.0,
          rank_aware_default_req_rank: int = 16,
          rank_aware_stats_timeout: float = 1.0,
+        use_hybrid_scheduling: bool = False,
+         hybrid_slo_threshold_ratio = 0.7,
     ):
         # Basic configuration
         self.unified_server_url = f"http://127.0.0.1:8000" 
@@ -135,6 +137,10 @@ class InstanceManager:
         # New: Track number of requests per engine
         self.engine_num_requests: Dict[int, int] = {i: 0 for i in range(num_instances)}
         
+        # Hybrid scheduling parameters
+        self.use_hybrid_scheduling: bool = use_hybrid_scheduling
+        self.hybrid_slo_threshold_ratio: float = hybrid_slo_threshold_ratio
+        
         # ── Rank-aware scheduling (Algorithm 1) ─────────────────────────────
         self.use_rank_aware_scheduling: bool = use_rank_aware_scheduling
         self.rank_aware_scheduler: Optional["RankAwareScheduler"] = None
@@ -156,7 +162,7 @@ class InstanceManager:
                 "Will fall back to size heuristic in _infer_req_rank()."
             )
 
-        if use_rank_aware_scheduling:
+        if use_rank_aware_scheduling or use_hybrid_scheduling:
             from sglang.srt.instances.rank_aware_scheduler import RankAwareScheduler
             self.rank_aware_scheduler = RankAwareScheduler(
                 instance_urls=instance_urls,
@@ -166,12 +172,20 @@ class InstanceManager:
                 default_req_rank=rank_aware_default_req_rank,
                 stats_timeout=rank_aware_stats_timeout,
             )
-            logger.info(
-                f"[InstanceManager] Rank-Aware Scheduling ENABLED  "
-                f"backend={rank_aware_backend}  "
-                f"slo={rank_aware_slo_ms}ms  "
-                f"avg_resp_len={rank_aware_avg_resp_len}"
-            )
+            if use_hybrid_scheduling:
+                logger.info(
+                    f"[InstanceManager] Hybrid Scheduling ENABLED  "
+                    f"slo_threshold_ratio={hybrid_slo_threshold_ratio}  "
+                    f"backend={rank_aware_backend}  "
+                    f"slo={rank_aware_slo_ms}ms"
+                )
+            else:
+                logger.info(
+                    f"[InstanceManager] Rank-Aware Scheduling ENABLED  "
+                    f"backend={rank_aware_backend}  "
+                    f"slo={rank_aware_slo_ms}ms  "
+                    f"avg_resp_len={rank_aware_avg_resp_len}"
+                )
         else:
             logger.info(
                 "[InstanceManager] Using original dLoRA dispatch scheduling"
@@ -901,21 +915,21 @@ class InstanceManager:
     #         logger.debug(f"Request {request_id} (model {model_id}) -> Engine {min_engine_id}")
             
     #         return min_engine_id
-    
     async def select_engine(
         self, request_id: str, model_id: int, req_seq_len: int = 1
     ) -> int:
         """
         Select engine for a new request.
 
-        If use_rank_aware_scheduling=True:
-            Runs TOPPINGS Algorithm 1.  Candidate engines are filtered the
-            same way as in the original dLoRA logic (model must be loaded /
-            dispatachable), then the one with minimum total_cost is chosen.
-
-        Else:
-            Falls back to original dLoRA dispatch logic (unmodified).
+        Priority:
+          1. use_hybrid_scheduling → dLoRA first, rank-aware when near SLO
+          2. use_rank_aware_scheduling → pure rank-aware (TOPPINGS Algorithm 1)
+          3. else → original dLoRA least-loaded dispatch
         """
+        if self.use_hybrid_scheduling and self.rank_aware_scheduler is not None:
+            return await self._select_engine_hybrid(
+                request_id, model_id, req_seq_len=req_seq_len
+            )
         if self.use_rank_aware_scheduling and self.rank_aware_scheduler is not None:
             return await self._select_engine_rank_aware(
                 request_id, model_id, req_seq_len=req_seq_len
@@ -998,8 +1012,7 @@ class InstanceManager:
             return min_engine_id
 
     # ── NEW: Rank-aware dispatch ───────────────────────────────────────────────
-
-    # 找到 _select_engine_rank_aware 的定义，改成如下：
+    
     async def _select_engine_rank_aware(
         self, request_id: str, model_id: int, req_seq_len: int = 1
     ) -> int:
@@ -1089,6 +1102,196 @@ class InstanceManager:
 
         # 3. Configured default
         return self.rank_aware_scheduler.default_req_rank
+    
+    # Hybrid scheduling (dLoRA first, then rank-aware when near SLO) is implemented in the main select_engine method.
+    async def _select_engine_hybrid(
+        self, request_id: str, model_id: int, req_seq_len: int = 1
+    ) -> int:
+        """
+        Hybrid dispatch: dLoRA-first + rank-aware fallback near SLO.
+
+        Phase 1 (always, under lock):
+          - Same as _select_engine_dlora: update costs, build candidate set,
+            handle DISPATCH_MIG substitution, pick least-loaded candidate.
+          - This gives us `dlora_choice` and the full candidate set.
+
+        Phase 2 (conditional, lock released):
+          - If ANY candidate engine's estimated decode latency >= SLO × threshold,
+            fetch rank-aware stats and re-rank candidates by TOPPINGS cost.
+          - Otherwise, just use the dLoRA choice directly.
+
+        Phase 3 (under lock):
+          - Apply the final selection, handle LoRA swap if needed.
+        """
+        slo_ms = self.rank_aware_scheduler.params.slo_ms
+        threshold = self.hybrid_slo_threshold_ratio
+
+        # ── Phase 1: dLoRA candidate selection (under lock) ──────────────────
+        async with self.select_lock:
+            self.expected_lora_distribution[model_id] += 1
+            await self._update_engine_costs()
+
+            # Ensure model has at least one engine assigned
+            if len(self.model_engine_mapping[model_id]) == 0:
+                engine_id = min(
+                    range(self.num_instances),
+                    key=lambda eid: self.engine_request_count[eid],
+                )
+                self.model_engine_mapping[model_id] = [engine_id]
+                self.engine_model_mapping[engine_id].append(model_id)
+                logger.info(
+                    f"[Hybrid] Added model {model_id} to engine {engine_id} "
+                    f"(no prior assignment)"
+                )
+                await self._apply_lora_placement_single(engine_id)
+
+            # Build candidate set (same logic as dLoRA)
+            candidate_engines: Dict[int, float] = {}
+            sub_engine_model_ids: Dict[int, int] = {}
+
+            for eid in self.model_engine_mapping[model_id]:
+                candidate_engines[eid] = self.engine_exec_cost.get(eid, 0)
+
+            if self.migration_type == MigrationType.DISPATCH_MIG:
+                for eid, req_model_cnt in self.engine_req_model_cnt.items():
+                    if eid in candidate_engines:
+                        continue
+                    for sub_model_id in self.engine_model_mapping[eid]:
+                        if (
+                            req_model_cnt.get(sub_model_id, 0) == 0
+                            and len(self.model_engine_mapping[sub_model_id]) > 1
+                        ):
+                            load_cost = self.lora_load_costs.get(
+                                model_id, self.default_exec_time
+                            )
+                            candidate_engines[eid] = (
+                                self.engine_exec_cost.get(eid, 0) + load_cost
+                            )
+                            sub_engine_model_ids[eid] = sub_model_id
+                            break
+
+            # dLoRA's default pick: least exec cost
+            if not candidate_engines:
+                dlora_choice = min(
+                    range(self.num_instances),
+                    key=lambda eid: self.engine_request_count[eid],
+                )
+                candidate_engines[dlora_choice] = 0.0
+                logger.warning(
+                    f"[Hybrid] No candidate engines for model {model_id}, "
+                    f"using least loaded: {dlora_choice}"
+                )
+            else:
+                dlora_choice = min(candidate_engines, key=candidate_engines.get)
+
+            # Snapshot what we need outside the lock
+            candidate_ids = list(candidate_engines.keys())
+            req_rank = self._infer_req_rank(model_id)
+
+        # ── Phase 2: Check if any candidate is near SLO ─────────────────────
+        # Fetch rank-aware states for all candidates
+        states = await self.rank_aware_scheduler._fetch_all(candidate_ids)
+
+        # Check: is any candidate engine's estimated latency near SLO?
+        need_rank_aware = False
+        for eid in candidate_ids:
+            state = states[eid]
+            if not state.fetch_ok:
+                continue
+            all_ranks = state.running_ranks + state.waiting_ranks
+            estimated_latency = self.rank_aware_scheduler._dec_perf(all_ranks)
+            if estimated_latency >= slo_ms * threshold:
+                need_rank_aware = True
+                logger.info(
+                    f"[Hybrid] Engine {eid} near SLO: "
+                    f"estimated={estimated_latency:.1f}ms >= "
+                    f"threshold={slo_ms * threshold:.1f}ms "
+                    f"(running={len(state.running_ranks)}, "
+                    f"waiting={len(state.waiting_ranks)}). "
+                    f"Switching to rank-aware selection."
+                )
+                break
+
+        if not need_rank_aware:
+            # ── Fast path: use dLoRA's choice directly ───────────────────────
+            final_choice = dlora_choice
+            logger.debug(
+                f"[Hybrid] All engines below SLO threshold, "
+                f"using dLoRA choice: engine {final_choice}"
+            )
+        else:
+            # ── Slow path: rank-aware cost scoring ───────────────────────────
+            best_eid = candidate_ids[0]
+            best_cost = math.inf
+
+            for eid in candidate_ids:
+                state = states[eid]
+
+                # Align waiting_seq_lens with waiting_ranks
+                w_seq_lens = state.waiting_seq_lens
+                if len(w_seq_lens) != len(state.waiting_ranks):
+                    w_seq_lens = [
+                        w_seq_lens[i]
+                        if i < len(w_seq_lens)
+                        else self.rank_aware_scheduler.default_seq_len
+                        for i in range(len(state.waiting_ranks))
+                    ]
+
+                cost = self.rank_aware_scheduler._calc_cost(
+                    req_rank=req_rank,
+                    req_seq_len=req_seq_len,
+                    running_ranks=state.running_ranks,
+                    waiting_ranks=state.waiting_ranks,
+                    waiting_seq_lens=w_seq_lens,
+                )
+                # Scale by queue depth (Algorithm 1)
+                num_reqs = max(state.total_requests, 1)
+                total_cost = cost * num_reqs
+
+                # Add dLoRA exec cost as tiebreaker (includes swap penalty)
+                dlora_penalty = candidate_engines.get(eid, 0)
+                total_cost += dlora_penalty
+
+                logger.debug(
+                    f"[Hybrid] engine={eid}  rank_cost={cost:.4f}  "
+                    f"num_reqs={num_reqs}  dlora_penalty={dlora_penalty:.2f}  "
+                    f"total={total_cost:.4f}"
+                )
+
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    best_eid = eid
+
+            final_choice = best_eid
+            logger.info(
+                f"[Hybrid] Rank-aware selected engine {final_choice} "
+                f"(total_cost={best_cost:.4f})"
+            )
+
+        # ── Phase 3: Apply selection (under lock) ────────────────────────────
+        async with self.select_lock:
+            # Handle LoRA swap if the chosen engine needs substitution
+            if final_choice in sub_engine_model_ids:
+                sub_model_id = sub_engine_model_ids[final_choice]
+                logger.info(
+                    f"[Hybrid] Substituting model {sub_model_id} with {model_id} "
+                    f"on engine {final_choice}"
+                )
+                self.engine_model_mapping[final_choice].remove(sub_model_id)
+                self.model_engine_mapping[sub_model_id].remove(final_choice)
+                self.engine_model_mapping[final_choice].append(model_id)
+                self.model_engine_mapping[model_id].append(final_choice)
+                await self._apply_lora_placement_single(final_choice)
+
+            self.request_to_engine[request_id] = final_choice
+            self.engine_request_count[final_choice] += 1
+
+        logger.debug(
+            f"[Hybrid] request {request_id} (model {model_id}, rank {req_rank}) "
+            f"→ engine {final_choice}  "
+            f"(rank_aware={'YES' if need_rank_aware else 'NO'})"
+        )
+        return final_choice
 
     
     def is_running(self) -> bool:
